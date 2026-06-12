@@ -39,7 +39,21 @@ namespace PedalDrumGrid
         readonly bool[] _hasTrig    = new bool[LANES];
         readonly bool[] _pendTrig   = new bool[LANES];
         readonly int[]  _pendVel    = new int[LANES];
-        readonly int[]  _pendPitch  = new int[LANES];
+        readonly int[]  _basePitch  = new int[LANES];   // per-lane base tuning (from the kit)
+        // Two command/argument slots per lane, captured per row at trigger time.
+        readonly int[]  _cmd1 = new int[LANES];
+        readonly int[]  _arg1 = new int[LANES];
+        readonly int[]  _cmd2 = new int[LANES];
+        readonly int[]  _arg2 = new int[LANES];
+
+        // Fixed sub-tick grid for the command columns — independent of the
+        // engine's Sub-Tick-Timing setting so Delay/Retrigger/Cut behave the
+        // same with it on or off. 12 divides 2/3/4/6 (even and triplet feels).
+        const int SUBTICKS_PER_TICK = 12;
+
+        // Command codes (Command 1/2 columns).
+        const int CMD_NONE = 0, CMD_DELAY = 1, CMD_RETRIG = 2, CMD_OFFSET = 3,
+                  CMD_REVERSE = 4, CMD_PITCH = 5, CMD_CUT = 6;
 
         // ---- the loaded kit / wavetable bridge ---------------------------
         readonly DrumKit _kit;
@@ -130,15 +144,16 @@ namespace PedalDrumGrid
         //  COLUMN LAYOUT in the pattern editor (left -> right):
         //    [ Trig 1 .. Trig 16 ]   global switches  -> the trigger grid
         //    [ Swing  Swing Phase  Humanize  Master Gain ]  other globals
-        //    [ per track: Velocity, Pitch ]            track params, repeated
+        //    [ per track: Velocity, Command 1, Argument 1, Command 2, Argument 2 ]
         //  (Per-lane wave assignment is GUI-only now, not a pattern column.)
         //
         //  Triggers MUST be globals, not track params: track params are laid
         //  out track-major (T0:all, T1:all, ...), so a track-param Trigger
-        //  would interleave with Velocity/Pitch and could never form a single
-        //  adjacent block. As 16 distinct globals they sit together at the far
-        //  left AND can't collide in parametersChanged (it's keyed by param),
-        //  so the trigger-collision recovery is only needed for Velocity/Pitch.
+        //  would interleave with the per-track columns and could never form a
+        //  single adjacent block. As 16 distinct globals they sit together at
+        //  the far left AND can't collide in parametersChanged (it's keyed by
+        //  param), so the trigger-collision recovery is only needed for the
+        //  track columns (Velocity + Command/Argument).
         // -----------------------------------------------------------------
 
         // ---- Trigger grid: 16 global switches, declared FIRST (leftmost). ---
@@ -168,42 +183,50 @@ namespace PedalDrumGrid
             _pendTrig[lane] = value;     // true = hit, explicit false = rest
             _hasTrig[lane]  = true;
 
-            // Capture this row's Velocity/Pitch for the firing lane straight
-            // from the param's pvalue. The trigger is a GLOBAL param consumed in
-            // Work; the Velocity/Pitch TRACK setters may not have updated
-            // _pendVel/_pendPitch by then (or at all for a pattern cell), so the
-            // hit would otherwise use a stale held value. The sequencer fills
-            // every pvalue for the row before any setter runs, so reading it
-            // here gets the same-row value. Own-lane only, hits only, and only
-            // while playing — so it can never clobber held values at load.
-            if (value) CaptureOwnLaneVelPitch(lane);
+            // Capture this row's Velocity + the two Command/Argument slots for
+            // the firing lane straight from each param's pvalue. The trigger is
+            // a GLOBAL param consumed in Work; the TRACK setters may not have
+            // updated the pending arrays by then (or at all for a pattern cell),
+            // so the hit would otherwise use stale data. The sequencer fills
+            // every pvalue for the row before any setter runs, so reading here
+            // gets the same-row values. Own-lane only, hits only, while playing.
+            if (value) CaptureOwnLaneRow(lane);
         }
 
-        void CaptureOwnLaneVelPitch(int lane)
+        void CaptureOwnLaneRow(int lane)
         {
+            // Commands are momentary (apply only on their row); default to None
+            // each hit unless a cell sets them. Velocity is held. So even when
+            // we can't read pvalues, clear the commands but leave velocity.
+            _cmd1[lane] = _arg1[lane] = _cmd2[lane] = _arg2[lane] = 0;
+
             bool playing; try { playing = Buzz?.Playing ?? false; } catch { return; }
             if (!playing) return;
 
-            // Only lanes with a real pattern track have a maintained Velocity/
-            // Pitch pvalue slot. Beyond TrackCount the int[256] slot was never
-            // NoValue-filled (it's still 0), so reading it would clobber the
-            // held default to 0 -> silent lane. Those lanes simply keep their
-            // held velocity/pitch (no per-step column exists for them).
+            // Only lanes with a real pattern track have a maintained pvalue slot.
+            // Beyond TrackCount the int[256] slot is still 0 (never NoValue-
+            // filled); reading it would clobber held velocity to 0 -> silent.
             int tc; try { tc = host?.Machine?.TrackCount ?? 0; } catch { tc = 0; }
             if (lane >= tc) return;
 
             if (!EnsurePollFields()) return;
-            if (_velPV != null)
+            if (_velPV != null)                       // velocity: held
             {
                 int vv = _velPV(lane);
                 if (vv != _velParam.NoValue) _pendVel[lane] = vv;
             }
-            if (_pitchPV != null)
-            {
-                int pp = _pitchPV(lane);
-                if (pp != _pitchParam.NoValue) _pendPitch[lane] = pp - 48;
-            }
-            if (DBG) Dbg($"  capture lane={lane} vel={_pendVel[lane]} pitch={_pendPitch[lane]}");
+            _cmd1[lane] = ReadMomentary(_cmd1Param, _cmd1PV, lane);   // commands: per-row
+            _arg1[lane] = ReadMomentary(_arg1Param, _arg1PV, lane);
+            _cmd2[lane] = ReadMomentary(_cmd2Param, _cmd2PV, lane);
+            _arg2[lane] = ReadMomentary(_arg2Param, _arg2PV, lane);
+            if (DBG) Dbg($"  capture lane={lane} vel={_pendVel[lane]} c1={_cmd1[lane]}/{_arg1[lane]} c2={_cmd2[lane]}/{_arg2[lane]}");
+        }
+
+        static int ReadMomentary(IParameter p, Func<int,int> pv, int lane)
+        {
+            if (p == null || pv == null) return 0;
+            int v = pv(lane);
+            return v == p.NoValue ? 0 : v;
         }
 
         // ---- Other globals (auto-persisted by ReBuzz, Core §39.3) -----------
@@ -266,11 +289,12 @@ namespace PedalDrumGrid
             return list;
         }
 
-        // ---- Track parameters (group 2): per-lane Velocity + Pitch ----------
+        // ---- Track parameters (group 2): Velocity + 2 Command/Argument slots -
         //  Rendered to the right of the global block, grouped per track:
-        //  [T0:Vel T0:Pitch][T1:Vel T1:Pitch]...  Stateful (held) so a value
-        //  entered once carries to following hits on that lane until changed.
-        //  Track index t == lane t == output slot t+1.
+        //  [T0:Vel Cmd1 Arg1 Cmd2 Arg2][T1:...]...  Velocity is held; the
+        //  command slots are momentary (apply only on their row). Track index
+        //  t == lane t == output slot t+1. (The old dedicated Pitch column is
+        //  now command 05.)
 
         [ParameterDecl(Name = "Velocity", MinValue = 0, MaxValue = 127, DefValue = 127,
             Description = "Per-lane velocity (0..127), held until changed")]
@@ -280,37 +304,44 @@ namespace PedalDrumGrid
             _pendVel[track] = value;
         }
 
-        [ParameterDecl(Name = "Pitch", MinValue = 0, MaxValue = 96, DefValue = 48,
-            Description = "Per-lane semitone offset, 48 = no shift (±48)")]
-        public void SetPitch(int value, int track)
-        {
-            if ((uint)track >= LANES) return;
-            _pendPitch[track] = value - 48;
-        }
+        // ValueDescriptions auto-sets Min=0, Max=length-1 and shows names in the
+        // pattern editor (Core §9). Argument is a byte 0..254 (255 is the byte
+        // NoValue sentinel — Core §9 ceiling); Offset/Reverse treat it as /255
+        // so FF=end still holds, FE being the enterable max (~99.6%).
+        [ParameterDecl(Name = "Command 1", DefValue = 0, Description = "Effect command, slot 1",
+            ValueDescriptions = new[] { "00 None", "01 Delay", "02 Retrig", "03 Offset", "04 Rev+Off", "05 Pitch", "06 Cut" })]
+        public void SetCmd1(int value, int track) { if ((uint)track < LANES) _cmd1[track] = value; }
+
+        [ParameterDecl(Name = "Argument 1", MinValue = 0, MaxValue = 254, DefValue = 0,
+            Description = "Argument for command slot 1")]
+        public void SetArg1(int value, int track) { if ((uint)track < LANES) _arg1[track] = value; }
+
+        [ParameterDecl(Name = "Command 2", DefValue = 0, Description = "Effect command, slot 2",
+            ValueDescriptions = new[] { "00 None", "01 Delay", "02 Retrig", "03 Offset", "04 Rev+Off", "05 Pitch", "06 Cut" })]
+        public void SetCmd2(int value, int track) { if ((uint)track < LANES) _cmd2[track] = value; }
+
+        [ParameterDecl(Name = "Argument 2", MinValue = 0, MaxValue = 254, DefValue = 0,
+            Description = "Argument for command slot 2")]
+        public void SetArg2(int value, int track) { if ((uint)track < LANES) _arg2[track] = value; }
 
         // =================================================================
-        //  Velocity/Pitch pvalue reader (Core §14/§42, Tracker §16)
+        //  Track-param pvalue reader (Core §14/§42, Tracker §16)
         // =================================================================
-        // Used by CaptureOwnLaneVelPitch (in SetTrig) to read the firing lane's
-        // OWN same-row Velocity/Pitch directly from the param's pvalue store.
-        // This is what makes pattern-cell velocity affect the hit: the trigger
-        // is a global param consumed in Work, so the track Velocity/Pitch setter
-        // may land too late (or, for a cell, the held value may simply not have
-        // been refreshed) — reading the pvalue at trigger time gets the row's
+        // Reads the firing lane's OWN same-row track values straight from each
+        // param's pvalue store (CaptureOwnLaneRow). This is what makes
+        // pattern-cell Velocity/Commands affect the hit: the trigger is a global
+        // param consumed in Work, so the track setters can land too late (or not
+        // at all for a cell) — reading the pvalue at trigger time gets the row's
         // value. Shape-tolerant: ConcurrentDictionary (<=1826) or int[256] (1827+).
-        //
-        // Same-row multi-lane collisions (Core §14): if two lanes change
-        // Velocity on one row, parametersChanged keeps only the last setter, but
-        // each lane reads its OWN pvalue here on its own trigger, so both hits
-        // still get the right value. We never poll sibling lanes (that was the
-        // load-time clobber), and never while stopped.
+        // Own-lane only (never siblings — that was the load-time clobber), and
+        // never while stopped, so Core §14 collisions are a non-issue.
         bool _pollResolved, _pollFailed;
-        IParameter _velParam, _pitchParam;
-        Func<int,int> _velPV, _pitchPV;
+        IParameter _velParam, _cmd1Param, _arg1Param, _cmd2Param, _arg2Param;
+        Func<int,int> _velPV, _cmd1PV, _arg1PV, _cmd2PV, _arg2PV;
 
         bool EnsurePollFields()
         {
-            if (_pollResolved) return _velPV != null || _pitchPV != null;
+            if (_pollResolved) return _velPV != null;
             if (_pollFailed)   return false;
             try
             {
@@ -318,11 +349,17 @@ namespace PedalDrumGrid
                 if (groups == null || groups.Count < 3) { _pollFailed = true; return false; }
                 foreach (var p in groups[2].Parameters)
                 {
-                    if (p.Name == "Velocity") { _velParam   = p; _velPV   = GetPValuesReader(p); }
-                    if (p.Name == "Pitch")    { _pitchParam = p; _pitchPV = GetPValuesReader(p); }
+                    switch (p.Name)
+                    {
+                        case "Velocity":   _velParam  = p; _velPV  = GetPValuesReader(p); break;
+                        case "Command 1":  _cmd1Param = p; _cmd1PV = GetPValuesReader(p); break;
+                        case "Argument 1": _arg1Param = p; _arg1PV = GetPValuesReader(p); break;
+                        case "Command 2":  _cmd2Param = p; _cmd2PV = GetPValuesReader(p); break;
+                        case "Argument 2": _arg2Param = p; _arg2PV = GetPValuesReader(p); break;
+                    }
                 }
                 _pollResolved = true;
-                return _velPV != null || _pitchPV != null;
+                return _velPV != null;
             }
             catch { _pollFailed = true; return false; }
         }
@@ -411,20 +448,71 @@ namespace PedalDrumGrid
         void ApplyPendingTriggers(int songPos)
         {
             int spt = SamplesPerTick();
+            int subSamples = Math.Max(1, spt / SUBTICKS_PER_TICK);
             for (int t = 0; t < LANES; t++)
             {
                 if (!_hasTrig[t]) continue;
                 _hasTrig[t] = false;
                 if (!_pendTrig[t]) { continue; }         // explicit 0 = rest
 
-                int delay = SwingDelaySamples(songPos, spt);
-                float velGain = _pendVel[t] / 127f;
-                int pitch = _pendPitch[t];
-
                 var snap = _kit.GetSnapshot(t);
-                if (DBG) Dbg($"fire lane={t} vel={_pendVel[t]} snap={(snap == null ? "NULL" : snap.Length + "smp")}");
+                if (snap == null) continue;
+
+                var spec = BuildSpec(t, SwingDelaySamples(songPos, spt), spt, subSamples);
+                if (DBG) Dbg($"fire lane={t} vel={_pendVel[t]} pitch={spec.PitchSemis} off={spec.StartOffset:0.00} rev={spec.Reverse} cut={spec.CutSamples} rtg={spec.RetrigInterval}/{spec.RetrigLength}");
                 ChokeGroupCut(t);
-                _voices[t].Trigger(velGain, pitch, delay, snap);
+                _voices[t].Trigger(in spec, snap);
+            }
+        }
+
+        // Translate a lane's two command slots into a voice TrigSpec. Cmd1 then
+        // Cmd2 — the second slot wins on conflicting fields (e.g. two Offsets),
+        // independent fields (Pitch + Delay) combine.
+        TrigSpec BuildSpec(int lane, int swingDelay, int spt, int subSamples)
+        {
+            var s = new TrigSpec
+            {
+                VelGain      = _pendVel[lane] / 127f,
+                PitchSemis   = _basePitch[lane],   // kit base tuning; Pitch cmd adds to it
+                StartOffset  = 0f,
+                Reverse      = false,
+                DelaySamples = swingDelay,
+                CutSamples   = 0,
+                RetrigInterval = 0,
+                RetrigLength   = 0,
+            };
+            ApplyCmd(ref s, _cmd1[lane], _arg1[lane], spt, subSamples);
+            ApplyCmd(ref s, _cmd2[lane], _arg2[lane], spt, subSamples);
+            return s;
+        }
+
+        void ApplyCmd(ref TrigSpec s, int cmd, int arg, int spt, int subSamples)
+        {
+            switch (cmd)
+            {
+                case CMD_DELAY:                                   // 01: + arg subticks
+                    s.DelaySamples += arg * subSamples;
+                    break;
+                case CMD_RETRIG:                                  // 02: hi nibble = interval (subticks), lo = ticks
+                    int iv = (arg >> 4) & 0xF, len = arg & 0xF;
+                    if (iv > 0)
+                    {
+                        s.RetrigInterval = iv * subSamples;
+                        s.RetrigLength   = Math.Max(1, len) * spt;
+                    }
+                    break;
+                case CMD_OFFSET:                                  // 03: forward from arg/255
+                    s.StartOffset = arg / 255f; s.Reverse = false;
+                    break;
+                case CMD_REVERSE:                                 // 04: backward from arg/255
+                    s.StartOffset = arg / 255f; s.Reverse = true;
+                    break;
+                case CMD_PITCH:                                   // 05: signed-byte semitones (00=none)
+                    s.PitchSemis += (arg < 128) ? arg : arg - 256;
+                    break;
+                case CMD_CUT:                                     // 06: stop after arg subticks
+                    if (arg > 0) s.CutSamples = arg * subSamples;
+                    break;
             }
         }
 
@@ -529,22 +617,23 @@ namespace PedalDrumGrid
         public DrumKit Kit => _kit;
         public IBuzzMachineHost Host => host;
 
-        // Kit load/save routed through the machine so per-lane velocity/pitch
-        // (held in _pendVel/_pendPitch) round-trip with the kit file.
+        // Kit load/save routed through the machine so per-lane velocity and the
+        // base tuning (_pendVel/_basePitch) round-trip with the kit file. The
+        // base tuning is added to every hit; the Pitch command (05) adjusts per row.
         public void LoadKit(string path)
         {
             _kit.LoadFromFile(path);
             for (int t = 0; t < LANES; t++)
             {
                 _pendVel[t]   = _kit.GetLaneVelocity(t);
-                _pendPitch[t] = _kit.GetLanePitch(t);
+                _basePitch[t] = _kit.GetLanePitch(t);
             }
         }
 
         public void SaveKit(string path)
         {
             for (int t = 0; t < LANES; t++)
-                _kit.SetLaneDefaults(t, _pendVel[t], _pendPitch[t]);
+                _kit.SetLaneDefaults(t, _pendVel[t], _basePitch[t]);
             _kit.SaveToFile(path);
         }
     }
