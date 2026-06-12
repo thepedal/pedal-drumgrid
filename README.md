@@ -6,12 +6,15 @@ has its own audio output for independent processing, plus per-lane Velocity and
 two tracker-style **Command/Argument** effect columns (v1.1). Samples come from the ReBuzz wavetable (assigned per lane in the
 GUI) or from a self-contained `.pdrumgrid.xml` kit with embedded audio.
 
-Status: **v1.0** — multi-out triggering, swing, kit load/save with embedded
-samples and per-lane names/velocity/pitch, and `MachineState` persistence are all
-working in ReBuzz (built/tested on the user's install). Follows the project's
-Core/Build conventions. The per-lane voice DSP is deliberately simple (linear
-interpolation, basic anti-click); a future pass could lift Tracker's
-interpolation table and deferred-trigger fade-cross (Tracker §4.2, §10).
+Status: **v1.3** — multi-out triggering, swing, kit load/save with embedded
+samples and per-lane names/velocity/base-tuning, and `MachineState` persistence
+are all working in ReBuzz (built/tested on the user's install). The two effect
+command columns (delay / retrigger / offset / reverse / pitch / cut) and per-row
+modulation of an in-flight roll (pitch / offset / reverse / cut) are in and
+tested. Follows the project's Core/Build conventions. The per-lane voice DSP is
+deliberately simple (linear interpolation, basic anti-click); a future pass could
+lift Tracker's interpolation table and deferred-trigger fade-cross (Tracker §4.2,
+§10).
 
 ---
 
@@ -162,13 +165,26 @@ The voice (`Voice.cs`) gained start-offset, reverse playback (`_dir`), a
 scheduled-cut countdown, and sample-accurate retrigger (silent gaps preserved
 when the sample is shorter than the interval).
 
+**Steering a roll from later rows (v1.2–v1.3).** While a retrigger is in flight,
+a command in either slot on a pass-over row modulates the roll, applied to the
+*next* re-fire: **Pitch** (`05`), **Offset** (`03`) and **Reverse** (`04`) change
+the character of each subsequent hit (arpeggios, sample-walks, backward rolls),
+and **Cut** (`06`) ends the roll that many subticks later. The per-row value is
+captured in the command **setters** (during setter delivery, not in `Work` — same
+reason as the §2 velocity capture), and only the slot whose setter fired is
+applied: Pitch/Offset/Reverse are *hold* values (kept until changed — an empty
+cell sends no setter), whereas Cut is a one-shot, so re-applying a held Cut from
+another slot's setter must be avoided or the roll would never end. Steps are
+discrete (they land on the next retrigger boundary) and per-row in granularity.
+Delay (`01`) and Retrigger (`02`) stay trigger-row-only.
+
 ---
 
 | File | Contents |
 |---|---|
 | `PedalDrumGrid.csproj` | Fully compliant with Build §1.2 (net10, UseWPF, no pdb/deps, NoWarn) + deploy to `Gear\Generators` (Build §1.3). |
 | `PedalDrumGrid.cs` | Machine: params (trigger grid + globals + per-track Velocity/Command/Argument), setters with collision recovery, per-row command capture + translation, multi-out `Work`, swing-as-delay, transport stop, `MachineState`, GUI factory. |
-| `Voice.cs` | Per-lane sample voice: linear-interp playback, velocity gain, deferred re-trigger fade, choke, start offset, reverse, scheduled cut, sample-accurate retrigger. |
+| `Voice.cs` | Per-lane sample voice: linear-interp playback, velocity gain, deferred re-trigger fade, choke, start offset, reverse, scheduled cut, sample-accurate retrigger with live per-row modulation (`SetRetrigPitch`/`SetRetrigOffset`/`SetRetrigCut`). |
 | `DrumKit.cs` | `.pdrumgrid.xml` load/save, wavetable snapshot via `GetDataAsFloat`, lane source resolution. |
 | `Gui.cs` | Embedded param-window GUI: kit load/save, per-lane wave assignment, swing controls. (Stub — wire to your preferred layout.) |
 

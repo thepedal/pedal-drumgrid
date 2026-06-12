@@ -43,6 +43,14 @@ namespace PedalDrumGrid
 
         // retrigger (02) — all in samples, 0 = inactive
         int _retrigInterval, _retrigCountdown, _retrigRemaining;
+        // pitch increment applied to the NEXT retrigger re-fire (v1.2 per-row
+        // pitch modulation). Restart() copies this into _inc, so a live pitch
+        // change lands on the next re-fire as a discrete step, not a mid-note bend.
+        double _retrigInc;
+        // direction adopted at the NEXT re-fire (v1.3 Reverse modulation). Kept
+        // separate from _dir so a live flip is discrete, not a mid-note reversal.
+        // Live Offset just writes _startPos, which is only read at (re)start.
+        int _retrigDir;
 
         // deferred re-trigger staging (a new hit while still sounding)
         bool _pendStaged;
@@ -50,6 +58,27 @@ namespace PedalDrumGrid
         WaveSnapshot _pendSnap;
 
         public bool Active => _active || _pendStaged || _delaySamples > 0 || _retrigInterval > 0;
+
+        // True while a roll is in flight — the machine polls per-row Pitch
+        // commands for these lanes and feeds SetRetrigPitch (v1.2).
+        public bool RetrigActive => _retrigInterval > 0 && _retrigRemaining > 0;
+
+        // Set the pitch (semitones) for subsequent retrigger re-fires.
+        public void SetRetrigPitch(int semitones) => _retrigInc = Math.Pow(2.0, semitones / 12.0);
+
+        // Set the start point (0..1) and direction for subsequent re-fires
+        // (v1.3 Offset / Reverse). Discrete: takes effect at the next re-fire.
+        public void SetRetrigOffset(float off, bool reverse)
+        {
+            if (off < 0f) off = 0f; if (off > 1f) off = 1f;
+            int len = _snap != null ? _snap.Length : 0;
+            _startPos  = len > 1 ? off * (len - 1) : 0;
+            _retrigDir = reverse ? -1 : +1;
+        }
+
+        // End the roll (v1.3 Cut): arm the existing whole-voice cut countdown,
+        // which fades the voice and clears the retrigger when it expires.
+        public void SetRetrigCut(int samples) { if (samples > 0) _cutCountdown = samples; }
 
         public void Trigger(in TrigSpec spec, WaveSnapshot snap)
         {
@@ -85,6 +114,8 @@ namespace PedalDrumGrid
 
             _gain   = 0f; _target = 1f; _active = true; _pendStaged = false;
             _inc    = Math.Pow(2.0, spec.PitchSemis / 12.0);
+            _retrigInc = _inc;            // retriggers start at the trigger-row pitch
+            _retrigDir = _dir;            // …and trigger-row direction
 
             _cutCountdown    = spec.CutSamples > 0 ? spec.CutSamples : -1;
             _retrigInterval  = spec.RetrigInterval;
@@ -92,11 +123,14 @@ namespace PedalDrumGrid
             _retrigRemaining = spec.RetrigLength;
         }
 
-        // Re-fire for a retrigger: restart the sample, keep timers/params.
+        // Re-fire for a retrigger: restart the sample, keep timers, adopt the
+        // latest live pitch/direction (set per row by SetRetrig*).
         void Restart()
         {
             _pos    = _startPos;
             _gain   = 0f; _target = 1f; _active = true;
+            _inc    = _retrigInc;
+            _dir    = _retrigDir;
         }
 
         public void Choke()    { if (_active) _target = 0f; _retrigInterval = 0; }

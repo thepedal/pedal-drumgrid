@@ -310,19 +310,47 @@ namespace PedalDrumGrid
         // so FF=end still holds, FE being the enterable max (~99.6%).
         [ParameterDecl(Name = "Command 1", DefValue = 0, Description = "Effect command, slot 1",
             ValueDescriptions = new[] { "00 None", "01 Delay", "02 Retrig", "03 Offset", "04 Rev+Off", "05 Pitch", "06 Cut" })]
-        public void SetCmd1(int value, int track) { if ((uint)track < LANES) _cmd1[track] = value; }
+        public void SetCmd1(int value, int track) { if ((uint)track < LANES) { _cmd1[track] = value; ModulateRetrig(track, 0); } }
 
         [ParameterDecl(Name = "Argument 1", MinValue = 0, MaxValue = 254, DefValue = 0,
             Description = "Argument for command slot 1")]
-        public void SetArg1(int value, int track) { if ((uint)track < LANES) _arg1[track] = value; }
+        public void SetArg1(int value, int track) { if ((uint)track < LANES) { _arg1[track] = value; ModulateRetrig(track, 0); } }
 
         [ParameterDecl(Name = "Command 2", DefValue = 0, Description = "Effect command, slot 2",
             ValueDescriptions = new[] { "00 None", "01 Delay", "02 Retrig", "03 Offset", "04 Rev+Off", "05 Pitch", "06 Cut" })]
-        public void SetCmd2(int value, int track) { if ((uint)track < LANES) _cmd2[track] = value; }
+        public void SetCmd2(int value, int track) { if ((uint)track < LANES) { _cmd2[track] = value; ModulateRetrig(track, 1); } }
 
         [ParameterDecl(Name = "Argument 2", MinValue = 0, MaxValue = 254, DefValue = 0,
             Description = "Argument for command slot 2")]
-        public void SetArg2(int value, int track) { if ((uint)track < LANES) _arg2[track] = value; }
+        public void SetArg2(int value, int track) { if ((uint)track < LANES) { _arg2[track] = value; ModulateRetrig(track, 1); } }
+
+        // Per-row modulation of an in-flight roll — captured HERE, during setter
+        // delivery, not in Work (reading per-row track data in Work is stale, the
+        // §2 hazard). On the rows a roll passes over, ReBuzz delivers that slot's
+        // Command/Argument setters; we apply ONLY the slot whose setter fired.
+        //
+        // Applying only the firing slot is deliberate: Pitch/Offset/Reverse are
+        // "hold" values (the voice keeps the last one — re-applying is harmless),
+        // but Cut is a one-shot that arms a countdown. If we re-applied a *held*
+        // Cut every time another slot's setter landed, the roll would never end.
+        // So each setter touches its own slot; an empty cell sends no setter, so
+        // hold-values hold and Cut stays armed exactly once.  (v1.2 Pitch; v1.3
+        // Offset / Reverse / Cut. Delay/Retrigger stay trigger-row-only.)
+        void ModulateRetrig(int lane, int slot)
+        {
+            if (!_voices[lane].RetrigActive) return;   // false on the trigger row itself
+            int cmd = slot == 0 ? _cmd1[lane] : _cmd2[lane];
+            int arg = slot == 0 ? _arg1[lane] : _arg2[lane];
+            var v = _voices[lane];
+            switch (cmd)
+            {
+                case CMD_PITCH:   v.SetRetrigPitch(_basePitch[lane] + SignedByte(arg)); break;
+                case CMD_OFFSET:  v.SetRetrigOffset(arg / 255f, false); break;
+                case CMD_REVERSE: v.SetRetrigOffset(arg / 255f, true);  break;
+                case CMD_CUT:     if (arg > 0) v.SetRetrigCut(arg * Math.Max(1, SamplesPerTick() / SUBTICKS_PER_TICK)); break;
+                // Delay/Retrigger/None: not meaningful as mid-roll modulation.
+            }
+        }
 
         // =================================================================
         //  Track-param pvalue reader (Core §14/§42, Tracker §16)
@@ -445,6 +473,8 @@ namespace PedalDrumGrid
         }
 
         // Apply this row's pending hits, scheduling swing delay on off-beats.
+        // Then, for any lane mid-retrigger that did NOT fire this row, read the
+        // row's Pitch command and steer the ongoing roll (v1.2).
         void ApplyPendingTriggers(int songPos)
         {
             int spt = SamplesPerTick();
@@ -453,7 +483,7 @@ namespace PedalDrumGrid
             {
                 if (!_hasTrig[t]) continue;
                 _hasTrig[t] = false;
-                if (!_pendTrig[t]) { continue; }         // explicit 0 = rest
+                if (!_pendTrig[t]) continue;            // explicit 0 = rest
 
                 var snap = _kit.GetSnapshot(t);
                 if (snap == null) continue;
@@ -462,8 +492,15 @@ namespace PedalDrumGrid
                 if (DBG) Dbg($"fire lane={t} vel={_pendVel[t]} pitch={spec.PitchSemis} off={spec.StartOffset:0.00} rev={spec.Reverse} cut={spec.CutSamples} rtg={spec.RetrigInterval}/{spec.RetrigLength}");
                 ChokeGroupCut(t);
                 _voices[t].Trigger(in spec, snap);
+                // Per-row retrigger pitch modulation is captured in the command
+                // setters (ModulateRetrig) during setter delivery, not here —
+                // reading per-row track data in Work would be stale (§2).
             }
         }
+
+        // Pitch arg encoding (shared with ApplyCmd / ModulateRetrig): 00 = none,
+        // 01..7F = +st, 80..FE = -128..-2 st (so -12 = F4).
+        static int SignedByte(int arg) => arg < 128 ? arg : arg - 256;
 
         // Translate a lane's two command slots into a voice TrigSpec. Cmd1 then
         // Cmd2 — the second slot wins on conflicting fields (e.g. two Offsets),
@@ -508,7 +545,7 @@ namespace PedalDrumGrid
                     s.StartOffset = arg / 255f; s.Reverse = true;
                     break;
                 case CMD_PITCH:                                   // 05: signed-byte semitones (00=none)
-                    s.PitchSemis += (arg < 128) ? arg : arg - 256;
+                    s.PitchSemis += SignedByte(arg);
                     break;
                 case CMD_CUT:                                     // 06: stop after arg subticks
                     if (arg > 0) s.CutSamples = arg * subSamples;
