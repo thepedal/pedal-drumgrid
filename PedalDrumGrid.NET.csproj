@@ -1,0 +1,55 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Build §1.2 — mandatory properties for every managed machine. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+    <NoWarn>MSB3277</NoWarn>
+
+    <OutputType>Library</OutputType>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <!-- Build §2 — the ".NET" suffix routes the dll to ReBuzz's managed loader.
+         Browser display name = filename minus extension = "Pedal DrumGrid". -->
+    <AssemblyName>Pedal DrumGrid.NET</AssemblyName>
+    <RootNamespace>PedalDrumGrid</RootNamespace>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <!-- ReBuzz host assemblies. Private=false — ReBuzz already loads these into
+       its AppDomain; shipping our own copies would split the static caches
+       (Presets §6). Adjust HintPath if ReBuzz lives elsewhere.
+       NOTE: do NOT reference ReBuzz.exe — it's a native apphost with no managed
+       metadata (causes MSB3246). All types come from the two DLLs below. -->
+  <ItemGroup>
+    <Reference Include="BuzzGUI.Interfaces">
+      <HintPath>C:\Program Files\ReBuzz\BuzzGUI.Interfaces.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BuzzGUI.Common">
+      <HintPath>C:\Program Files\ReBuzz\BuzzGUI.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- GUI is built in code, not XAML, to dodge BAML issues (Chord §1). -->
+  <ItemGroup>
+    <Page Remove="**\*.xaml" />
+    <EmbeddedResource Remove="**\*.xaml" />
+  </ItemGroup>
+
+  <!-- Build §1.3 — deploy just the dll ($(TargetPath)) to the gear folder on
+       every build. ContinueOnError handles ReBuzz holding the dll open. -->
+  <Target Name="DeployToReBuzz" AfterTargets="Build">
+    <Message Text="Deploying $(TargetFileName) -> C:\Program Files\ReBuzz\Gear\Generators\"
+             Importance="high" />
+    <Copy SourceFiles="$(TargetPath)"
+          DestinationFolder="C:\Program Files\ReBuzz\Gear\Generators\"
+          ContinueOnError="true" />
+  </Target>
+
+</Project>

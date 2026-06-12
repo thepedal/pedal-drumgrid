@@ -1,0 +1,145 @@
+# Pedal DrumGrid
+
+A 16-lane multi-out drum-pattern sampler for ReBuzz. The trigger grid is 16
+global `Trig` switches in the pattern editor (type `1` to fire a hit); each lane
+has its own audio output for independent processing, plus per-lane Velocity/Pitch
+track columns. Samples come from the ReBuzz wavetable (assigned per lane in the
+GUI) or from a self-contained `.pdrumgrid.xml` kit with embedded audio.
+
+Status: **v1.0** — multi-out triggering, swing, kit load/save with embedded
+samples and per-lane names/velocity/pitch, and `MachineState` persistence are all
+working in ReBuzz (built/tested on the user's install). Follows the project's
+Core/Build conventions. The per-lane voice DSP is deliberately simple (linear
+interpolation, basic anti-click); a future pass could lift Tracker's
+interpolation table and deferred-trigger fade-cross (Tracker §4.2, §10).
+
+---
+
+## Architecture decisions (and where they come from)
+
+| Decision | Rationale (notes ref) |
+|---|---|
+| Trigger grid = **16 global switches** (`Trig 1..16`), one per lane | Track params are laid out track-major, so a track-param trigger interleaves with Velocity/Pitch and can't form one adjacent block. As distinct globals the triggers sit together at the far left (Core §9 `bool`→Switch; §25 `IsStateless` = pattern-only) and **can't collide** in `parametersChanged`. Velocity/Pitch stay track params → grouped per-track on the right. |
+| Column order: `[Trig 1..16][Swing  Swing Phase  Humanize  Master Gain][per-track Vel,Pitch]` | Globals render before the track section (Roster song-authoring facts). Triggers declared first → leftmost; wave assignment is GUI-only (not a column). Expand the machine's track count to 16 to expose all per-lane Velocity/Pitch columns. |
+| **Multi-out** via the `IList<Sample[]>` Work overload | Defining that overload sets `MULTI_IO` automatically (Tracker §12.1). Out 0 = master sum, outs 1..N = per-lane dry (Tracker §12.3). |
+| `OutputCount = LANES + 1` declared up front (static headroom) | Auto-syncing `OutputCount` to track count crashes on song reload when a saved connection references a channel ≥ current count (Tracker §12.2). Unconnected slots are `null` and cost nothing. |
+| **Velocity/Pitch are held per lane** (no pvalue recovery) | `Velocity`/`Pitch` are track params; same-row multi-lane *changes* collide in `parametersChanged` (Core §14) and the non-last lane keeps its held value — imperceptible for sparse drum velocities. An earlier pvalue-poll recovery was removed: at load the `int[256]` pvalues array is all `0` (not the `NoValue` sentinel), so the poll clobbered held velocities to `0` and silenced lanes. A lane is now silent only if its velocity is explicitly `0`. |
+| Per-lane **wave assignment is GUI-only**, persisted in `MachineState` | Kept off the pattern grid so the trigger block butts against the per-track Vel/Pitch section. The GUI's 16 per-lane pickers point each lane at a wavetable slot; the kit is the single source of truth and its full per-lane state (wavetable slot or file path) is serialised in `MachineState` v2 (Core §39), since non-parameter state isn't auto-persisted. |
+| **Swing** = per-step trigger *delay*, not a step clock | DrumGrid doesn't own a step clock — triggers arrive from pattern rows. So swing delays off-beat steps using sub-tick scheduling (Tracker §7.7 note-delay machinery), reusing Chord's ratio math (Chord §3, §11) recast as a delay. See "Swing" below. |
+| State (kit ref, swing, gains) framed `byte[]` `MachineState` | Magic+version+length-prefixed framing (Core §39.1). Wave-slot assignments persist as ordinary parameters; the kit *file reference* and any embedded-kit blob go in `MachineState`. |
+| GUI base class = `FrameworkElement` (if custom-painted) | `UserControl`'s template silently overpaints `OnRender` (Core §26.7). The kit/swing panel is control-composed, so it can stay `UserControl`; the optional lane meters/grid preview must be `FrameworkElement`. |
+
+### Open choices you may want to change
+- **Lane count.** Scaffold uses `LANES = 16` (→ `OutputCount = 17`), matching
+  Tracker's `MAX_VOICES`. Drop to 8 if you want a tighter grid.
+- **Per-step columns.** Scaffold gives 16 global `Trig` switches + per-lane
+  `Velocity` (byte 0–127) + `Pitch` (semitone offset) track columns. Drop `Pitch` if lanes are
+  fixed-pitch one-shots. Parameter *order* isn't locked against shipped presets
+  yet, so reordering now is free (Build §3.3).
+- **Voicing per lane.** Scaffold = 1 voice/lane with deferred re-trigger
+  fade-cross + choke groups (the drum-machine model). A small voice pool per
+  lane (for overlapping tom tails) is a later option.
+
+---
+
+## `.pdrumgrid.xml` kit file
+
+A kit bundles, per lane: a sample source and lane defaults (velocity, pitch,
+choke group, root note). **Save Kit embeds the actual audio** (16-bit PCM WAV,
+base64) so a kit is fully self-contained — no external files or wavetable slots
+needed to share or reload it. Three source kinds are understood on load:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<PedalDrumGrid version="2" name="808 Core">
+  <!-- embedded: what Save Kit writes — audio baked in (base64 16-bit WAV) -->
+  <Lane index="0" name="Kick">
+    <Sample kind="embedded" rootNote="60">UklGRiQAAABXQVZF…(base64)…</Sample>
+    <Defaults velocity="127" pitch="0" chokeGroup="0" />
+  </Lane>
+  <!-- file: reference a wav on disk (relative to the .pdrumgrid.xml, then absolute) -->
+  <Lane index="1" name="Snare">
+    <Sample kind="file" path="samples/808/snare.wav" rootNote="60" />
+    <Defaults velocity="110" pitch="0" chokeGroup="0" />
+  </Lane>
+  <!-- wavetable: reference a ReBuzz wavetable slot (1-based) -->
+  <Lane index="2" name="CH">
+    <Sample kind="wavetable" waveIndex="7" />
+    <Defaults velocity="90" pitch="0" chokeGroup="1" />
+  </Lane>
+</PedalDrumGrid>
+```
+
+- `kind="embedded"` — base64 16-bit PCM WAV, decoded at load. The output of
+  Save Kit (it encodes each lane's in-memory snapshot via `WavWriter`,
+  whatever the lane's original source). Self-contained.
+- `kind="file"` — PCM wav read at load (`WavReader`); for non-wav, import into
+  the wavetable first and use `wavetable`.
+- `kind="wavetable"` — `waveIndex` is a 1-based ReBuzz wavetable slot, read live
+  via `GetDataAsFloat` (Tracker §7.1).
+- `Defaults` round-trip per-lane **velocity** and **pitch** (captured from the
+  held `_pendVel`/`_pendPitch` on save, re-applied on load) and **chokeGroup**
+  (lanes sharing a non-zero group cut each other — hi-hats).
+- The per-lane **`name`** is captured from the wavetable wave when you assign a
+  lane (or the file name for `file` lanes), is editable in the GUI, and persists
+  in both the kit file and `MachineState` (v3).
+- Save Kit always **embeds**; it's non-destructive (the live lanes keep their
+  wavetable/file links, only the file gets the baked audio).
+
+Snapshots are pre-built on the UI thread after load (`PrebuildAll`) so the first
+hit never decodes on the audio thread (M1 §2).
+
+The kit's full per-lane state — including embedded audio — is also serialised in
+`MachineState` v2, so a song that uses an embedded kit stays self-contained on
+reload (no missing samples). Velocity/pitch stay with the track params in the
+song (ReBuzz-persisted) to avoid duplicate persistence (PedalTracker §13.1); the
+kit *file* is where velocity round-trips.
+
+Per-lane wavetable assignment is done in the **GUI** (16 pickers, populated from
+the current wavetable). Picking a slot points that lane at the wavetable; Save
+Kit then bakes its audio into the manifest.
+
+---
+
+## Swing (reusing Pedal Chord's ratio math)
+
+Chord computes a long/short split of a step pair with the invariant
+`long + short == 2·Speed`, which keeps average tempo locked at every swing value
+(Chord §3.1, §11.3). DrumGrid doesn't generate steps — the pattern does — so the
+same ratio is applied as a **delay on the off-beat step**:
+
+```
+ratio = 1 + Swing/100                  // 0..100  ->  1.0..2.0
+long  = 2 * ratio / (ratio + 1)        // in units of one step (tick), 1.0..1.333
+delayTicks (off-beat step) = long - 1  // 0 at Swing 0, 1/3 tick at Swing 100
+delaySamples = delayTicks * MasterInfo.SamplesPerTick
+```
+
+Off-beat is chosen by step parity from `Song.PlayPosition` (Tracker §2.3), with a
+`Swing Phase` switch to flip which step of the pair is delayed (Chord's
+`SwingPhaseVal`). The delay is realised with the sub-tick note-delay countdown
+(Tracker §7.7): on an off-beat trigger, stage the hit with
+`v.TriggerDelaySamples = delaySamples` and fire it inside `Work()` when the
+countdown reaches 0. `Humanize` adds non-cumulative jitter on top, so it never
+drifts tempo (Chord §3). Because it's a per-trigger delay rather than a step
+clock, it's tempo-locked and independent of the Sub-Tick Timing setting by
+construction (Chord §11.3) — no `SubTickInfo` read at all.
+
+---
+
+## Files
+
+| File | Contents |
+|---|---|
+| `PedalDrumGrid.csproj` | Fully compliant with Build §1.2 (net10, UseWPF, no pdb/deps, NoWarn) + deploy to `Gear\Generators` (Build §1.3). |
+| `PedalDrumGrid.cs` | Machine: params (trigger grid + globals), setters with collision recovery, multi-out `Work`, swing-as-delay, transport stop, `MachineState`, GUI factory. |
+| `Voice.cs` | Per-lane sample voice: linear-interp playback, velocity gain, deferred re-trigger fade, choke. |
+| `DrumKit.cs` | `.pdrumgrid.xml` load/save, wavetable snapshot via `GetDataAsFloat`, lane source resolution. |
+| `Gui.cs` | Embedded param-window GUI: kit load/save, per-lane wave assignment, swing controls. (Stub — wire to your preferred layout.) |
+
+## Build / deploy
+Compliant per Build §1: `net10.0-windows`, `UseWPF=true`, `DebugType=none`,
+`DebugSymbols=false`, `GenerateDependencyFile=false`, `NoWarn=MSB3277`.
+`AssemblyName = "Pedal DrumGrid.NET"` (the `.NET` suffix routes it to the managed
+loader — Build §2). Post-build copies the dll to
+`C:\Program Files\ReBuzz\Gear\Generators\`.
