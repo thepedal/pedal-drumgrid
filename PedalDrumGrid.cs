@@ -67,6 +67,53 @@ namespace PedalDrumGrid
                 _trackR[t]  = new float[MAX_BLOCK];
                 _pendVel[t] = 127;
             }
+            ScheduleEnsureTracks();   // start with all 16 lanes' tracks (§ below)
+        }
+
+        // ---- Initial track count -----------------------------------------
+        //  The machine always has 16 lanes, so it should start with 16 pattern
+        //  tracks — no manual "add track" needed to expose per-lane Velocity/
+        //  Pitch columns. MachineDecl has no MinTracks, so it's set
+        //  programmatically. The TrackCount setter modifies machine structure
+        //  and must run on the UI thread, never from Work() (Core §21); and
+        //  host.Machine is null at construction (Core §16.1). So we queue it on
+        //  the dispatcher, idempotently, and only RAISE to 16 once — a user who
+        //  later reduces the count isn't fought.
+        bool _tracksInit, _tracksScheduled;
+
+        void ScheduleEnsureTracks()
+        {
+            if (_tracksInit || _tracksScheduled) return;
+            _tracksScheduled = true;
+            try
+            {
+                var disp = System.Windows.Application.Current?.Dispatcher;
+                if (disp != null) disp.BeginInvoke((Action)EnsureInitialTracks);
+                else { _tracksScheduled = false; EnsureInitialTracks(); }
+            }
+            catch { _tracksScheduled = false; }
+        }
+
+        void EnsureInitialTracks()
+        {
+            _tracksScheduled = false;
+            if (_tracksInit) return;
+            var m = host?.Machine;
+            if (m == null) return;            // not ready yet — a later Work reschedules
+            try
+            {
+                if (m.TrackCount < LANES) m.TrackCount = LANES;
+                _tracksInit = true;
+            }
+            catch
+            {
+                try
+                {
+                    var p = m.GetType().GetProperty("TrackCount");
+                    if (p?.CanWrite == true) { p.SetValue(m, LANES); _tracksInit = true; }
+                }
+                catch { }
+            }
         }
 
         // ---- DIAGNOSTICS (Core §10 / Tracker §8) -------------------------
@@ -120,7 +167,43 @@ namespace PedalDrumGrid
             if (DBG) Dbg($"SetTrig lane={lane} val={value}");
             _pendTrig[lane] = value;     // true = hit, explicit false = rest
             _hasTrig[lane]  = true;
-            // No sibling poll needed — each Trig is its own global parameter.
+
+            // Capture this row's Velocity/Pitch for the firing lane straight
+            // from the param's pvalue. The trigger is a GLOBAL param consumed in
+            // Work; the Velocity/Pitch TRACK setters may not have updated
+            // _pendVel/_pendPitch by then (or at all for a pattern cell), so the
+            // hit would otherwise use a stale held value. The sequencer fills
+            // every pvalue for the row before any setter runs, so reading it
+            // here gets the same-row value. Own-lane only, hits only, and only
+            // while playing — so it can never clobber held values at load.
+            if (value) CaptureOwnLaneVelPitch(lane);
+        }
+
+        void CaptureOwnLaneVelPitch(int lane)
+        {
+            bool playing; try { playing = Buzz?.Playing ?? false; } catch { return; }
+            if (!playing) return;
+
+            // Only lanes with a real pattern track have a maintained Velocity/
+            // Pitch pvalue slot. Beyond TrackCount the int[256] slot was never
+            // NoValue-filled (it's still 0), so reading it would clobber the
+            // held default to 0 -> silent lane. Those lanes simply keep their
+            // held velocity/pitch (no per-step column exists for them).
+            int tc; try { tc = host?.Machine?.TrackCount ?? 0; } catch { tc = 0; }
+            if (lane >= tc) return;
+
+            if (!EnsurePollFields()) return;
+            if (_velPV != null)
+            {
+                int vv = _velPV(lane);
+                if (vv != _velParam.NoValue) _pendVel[lane] = vv;
+            }
+            if (_pitchPV != null)
+            {
+                int pp = _pitchPV(lane);
+                if (pp != _pitchParam.NoValue) _pendPitch[lane] = pp - 48;
+            }
+            if (DBG) Dbg($"  capture lane={lane} vel={_pendVel[lane]} pitch={_pendPitch[lane]}");
         }
 
         // ---- Other globals (auto-persisted by ReBuzz, Core §39.3) -----------
@@ -206,19 +289,62 @@ namespace PedalDrumGrid
         }
 
         // =================================================================
-        //  NOTE on Velocity/Pitch collisions (Core §14)
+        //  Velocity/Pitch pvalue reader (Core §14/§42, Tracker §16)
         // =================================================================
-        // Velocity & Pitch are track params; if two lanes change them on the
-        // SAME row, parametersChanged keeps only the last writer and the other
-        // lane keeps its previously-held value for that row. For HELD, sparsely
-        // edited drum velocities this is imperceptible, so we accept it rather
-        // than poll sibling pvalues. An earlier pvalue-poll recovery was removed
-        // because, at load/track-create time, the int[256] pvalues array is all
-        // 0 (not the NoValue sentinel) and the poll clobbered every sibling
-        // lane's held velocity to 0 -> silent lanes. A lane is now silent only
-        // if its velocity is explicitly set to 0. (If dense same-row multi-lane
-        // accents ever matter, re-add recovery guarded on Buzz.Playing AND the
-        // real TrackCount, or move Velocity to non-colliding per-lane globals.)
+        // Used by CaptureOwnLaneVelPitch (in SetTrig) to read the firing lane's
+        // OWN same-row Velocity/Pitch directly from the param's pvalue store.
+        // This is what makes pattern-cell velocity affect the hit: the trigger
+        // is a global param consumed in Work, so the track Velocity/Pitch setter
+        // may land too late (or, for a cell, the held value may simply not have
+        // been refreshed) — reading the pvalue at trigger time gets the row's
+        // value. Shape-tolerant: ConcurrentDictionary (<=1826) or int[256] (1827+).
+        //
+        // Same-row multi-lane collisions (Core §14): if two lanes change
+        // Velocity on one row, parametersChanged keeps only the last setter, but
+        // each lane reads its OWN pvalue here on its own trigger, so both hits
+        // still get the right value. We never poll sibling lanes (that was the
+        // load-time clobber), and never while stopped.
+        bool _pollResolved, _pollFailed;
+        IParameter _velParam, _pitchParam;
+        Func<int,int> _velPV, _pitchPV;
+
+        bool EnsurePollFields()
+        {
+            if (_pollResolved) return _velPV != null || _pitchPV != null;
+            if (_pollFailed)   return false;
+            try
+            {
+                var groups = host?.Machine?.ParameterGroups;
+                if (groups == null || groups.Count < 3) { _pollFailed = true; return false; }
+                foreach (var p in groups[2].Parameters)
+                {
+                    if (p.Name == "Velocity") { _velParam   = p; _velPV   = GetPValuesReader(p); }
+                    if (p.Name == "Pitch")    { _pitchParam = p; _pitchPV = GetPValuesReader(p); }
+                }
+                _pollResolved = true;
+                return _velPV != null || _pitchPV != null;
+            }
+            catch { _pollFailed = true; return false; }
+        }
+
+        // Tracker §16.3 — detect the pvalues backing shape at runtime; never a
+        // bare 'as' cast (silently nulls on type change between builds).
+        static Func<int,int> GetPValuesReader(IParameter p)
+        {
+            var fi = p.GetType().GetField("pvalues",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            if (fi == null) return null;
+            object raw = fi.GetValue(p);
+            if (raw == null) return null;
+            int noVal = p.NoValue;
+            if (raw is int[] arr)
+                return t => (uint)t < (uint)arr.Length ? arr[t] : noVal;
+            if (raw is System.Collections.Concurrent.ConcurrentDictionary<int,int> dict)
+                return t => dict.TryGetValue(t, out int v) ? v : noVal;
+            if (raw is System.Collections.IDictionary idict)
+                return t => idict.Contains(t) ? (int)idict[t] : noVal;
+            return null;
+        }
 
         // =================================================================
         //  WORK — multi-out (defining this overload sets MULTI_IO, §12.1)
@@ -238,6 +364,7 @@ namespace PedalDrumGrid
             }
 
             CheckTransport();
+            ScheduleEnsureTracks();   // safety net: retries if host.Machine wasn't ready at construction
 
             // New-row edge via PlayPosition (Tracker §2.3) — not PosInTick.
             int songPos = -1;
