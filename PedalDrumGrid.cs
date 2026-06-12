@@ -60,6 +60,7 @@ namespace PedalDrumGrid
 
         // ---- globals -----------------------------------------------------
         int  _swing;        // 0..100
+        int  _swingUnit;    // 0 = 1/8, 1 = 1/16
         int  _swingPhase;   // 0/1 which step of the pair is delayed
         int  _humanize;     // 0..100
         int  _masterGain;   // 0..200, 100 = unity
@@ -232,11 +233,11 @@ namespace PedalDrumGrid
         // ---- Other globals (auto-persisted by ReBuzz, Core §39.3) -----------
 
         [ParameterDecl(Name = "Swing", MinValue = 0, MaxValue = 100, DefValue = 0,
-            Description = "0 = straight, 100 ~ 2:1 shuffle")]
+            Description = "0 = straight, 100 ~ 2:1 shuffle. See Swing Unit / Swing Phase.")]
         public int Swing { get => _swing; set => _swing = value; }
 
         [ParameterDecl(Name = "Swing Phase", MinValue = 0, MaxValue = 1, DefValue = 0,
-            Description = "Which step of the pair gets the delay")]
+            Description = "0 = delay the off-beat (normal), 1 = delay the on-beat (drag)")]
         public int SwingPhase { get => _swingPhase; set => _swingPhase = value; }
 
         [ParameterDecl(Name = "Humanize", MinValue = 0, MaxValue = 100, DefValue = 0,
@@ -246,6 +247,16 @@ namespace PedalDrumGrid
         [ParameterDecl(Name = "Master Gain", MinValue = 0, MaxValue = 200, DefValue = 100,
             Description = "Master mix gain on out 0 (100 = unity)")]
         public int MasterGain { get => _masterGain; set => _masterGain = value; }
+
+        // Appended after the original globals (not grouped with Swing) so existing
+        // songs keep their Swing Phase / Humanize / Master Gain indices. The note
+        // value the swing displaces, taken off the beat grid (TicksPerBeat) so it
+        // works at any pattern row resolution: 1/8 shuffles the off-beat eighths
+        // (the usual groove), 1/16 shuffles the off-beat sixteenths (hat swing).
+        [ParameterDecl(Name = "Swing Unit", DefValue = 0,
+            ValueDescriptions = new[] { "1/8 (shuffle)", "1/16 (hat)" },
+            Description = "Note value the swing displaces")]
+        public int SwingUnit { get => _swingUnit; set => _swingUnit = value; }
 
         // Per-lane wave assignment is NOT a parameter — it lives in the GUI
         // (kept off the pattern grid) and persists via MachineState. The kit is
@@ -554,15 +565,30 @@ namespace PedalDrumGrid
         }
 
         // Chord §3/§11 ratio math, recast as an off-beat delay (README "Swing").
+        // Swing = delay the off-beat half of each swing-unit pair. The unit is
+        // taken off the beat grid (TicksPerBeat) so it works at any pattern row
+        // resolution: 1/8 = half a beat in rows, 1/16 = a quarter beat. This is
+        // why the old per-row-parity version did nothing on a beat whose hits
+        // all sat on the same parity (e.g. eighth-note content on even rows) —
+        // there was no neighbour at the opposite parity to displace against.
         int SwingDelaySamples(int songPos, int samplesPerTick)
         {
             if (_swing <= 0 || songPos < 0) return 0;
-            bool offBeat = ((songPos & 1) == (_swingPhase & 1));
-            if (!offBeat) return 0;
-            double ratio   = 1.0 + _swing / 100.0;             // 1..2
-            double longTks = 2.0 * ratio / (ratio + 1.0);      // 1..1.333 (per step pair)
-            double delayT  = longTks - 1.0;                    // 0..0.333 tick
-            int delay = (int)Math.Round(delayT * samplesPerTick);
+
+            int tpb = 4;
+            try { tpb = Math.Max(1, host?.MasterInfo?.TicksPerBeat ?? 4); } catch { }
+            int rowsPerStep = _swingUnit == 0 ? Math.Max(1, tpb / 2)    // 1/8
+                                              : Math.Max(1, tpb / 4);   // 1/16
+
+            // half = 0 on the down-step, 1 on the off-step. Delay the off-step
+            // by default; SwingPhase = 1 flips it to a drag feel.
+            int half = (songPos / rowsPerStep) & 1;
+            bool delayThis = _swingPhase == 0 ? half == 1 : half == 0;
+            if (!delayThis) return 0;
+
+            double ratio = 1.0 + _swing / 100.0;                 // 1..2
+            double frac  = 2.0 * ratio / (ratio + 1.0) - 1.0;    // 0..0.333 of the unit
+            int delay = (int)Math.Round(frac * rowsPerStep * samplesPerTick);
             if (_humanize > 0)
             {
                 int drift = (int)Math.Round(samplesPerTick * _humanize / 200.0);

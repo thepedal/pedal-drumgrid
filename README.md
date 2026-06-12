@@ -6,15 +6,15 @@ has its own audio output for independent processing, plus per-lane Velocity and
 two tracker-style **Command/Argument** effect columns (v1.1). Samples come from the ReBuzz wavetable (assigned per lane in the
 GUI) or from a self-contained `.pdrumgrid.xml` kit with embedded audio.
 
-Status: **v1.3** — multi-out triggering, swing, kit load/save with embedded
-samples and per-lane names/velocity/base-tuning, and `MachineState` persistence
-are all working in ReBuzz (built/tested on the user's install). The two effect
-command columns (delay / retrigger / offset / reverse / pitch / cut) and per-row
-modulation of an in-flight roll (pitch / offset / reverse / cut) are in and
-tested. Follows the project's Core/Build conventions. The per-lane voice DSP is
-deliberately simple (linear interpolation, basic anti-click); a future pass could
-lift Tracker's interpolation table and deferred-trigger fade-cross (Tracker §4.2,
-§10).
+Status: **v1.4** — multi-out triggering, grid-aware swing (`Swing Unit` 1/8 or
+1/16), kit load/save with embedded samples and per-lane names/velocity/base-
+tuning, and `MachineState` persistence are all working in ReBuzz (built/tested on
+the user's install). The two effect command columns (delay / retrigger / offset /
+reverse / pitch / cut) and per-row modulation of an in-flight roll (pitch / offset
+/ reverse / cut) are in and tested. Follows the project's Core/Build conventions.
+The per-lane voice DSP is deliberately simple (linear interpolation, basic anti-
+click); a future pass could lift Tracker's interpolation table and deferred-
+trigger fade-cross (Tracker §4.2, §10).
 
 ---
 
@@ -113,19 +113,28 @@ Chord computes a long/short split of a step pair with the invariant
 same ratio is applied as a **delay on the off-beat step**:
 
 ```
-ratio = 1 + Swing/100                  // 0..100  ->  1.0..2.0
-long  = 2 * ratio / (ratio + 1)        // in units of one step (tick), 1.0..1.333
-delayTicks (off-beat step) = long - 1  // 0 at Swing 0, 1/3 tick at Swing 100
-delaySamples = delayTicks * MasterInfo.SamplesPerTick
+ratio = 1 + Swing/100                   // 0..100  ->  1.0..2.0
+frac  = 2*ratio/(ratio+1) - 1           // 0 at Swing 0, 1/3 at Swing 100
+delaySamples = frac * rowsPerStep * MasterInfo.SamplesPerTick
 ```
 
-Off-beat is chosen by step parity from `Song.PlayPosition` (Tracker §2.3), with a
-`Swing Phase` switch to flip which step of the pair is delayed (Chord's
-`SwingPhaseVal`). The delay is realised with the sub-tick note-delay countdown
-(Tracker §7.7): on an off-beat trigger, stage the hit with
-`v.TriggerDelaySamples = delaySamples` and fire it inside `Work()` when the
-countdown reaches 0. `Humanize` adds non-cumulative jitter on top, so it never
-drifts tempo (Chord §3). Because it's a per-trigger delay rather than a step
+The swing operates on a **swing unit** taken off the beat grid, not on raw
+pattern rows. `Swing Unit` = 1/8 or 1/16; from `MasterInfo.TicksPerBeat` (rows
+per beat) that becomes `rowsPerStep = TPB/2` (1/8) or `TPB/4` (1/16). Each pair
+of swing units is one on-step + one off-step; the off-step's hits are delayed by
+`frac` of a unit (up to a 2:1 triplet at Swing 100). `Swing Phase` flips which
+half is delayed (1 = drag).
+
+This grid-relative form is the v1.4 fix for swing reading as "no effect": the old
+version keyed the off-beat off raw **row parity**, so a beat whose hits all sat on
+the same parity (eighth-note content on even rows) got a uniform shift with no
+neighbour to displace against — straight in, straight out. Choosing the unit off
+the beat grid means 1/8 shuffles the eighths and 1/16 the sixteenths regardless of
+the pattern's row resolution. Off-beat selection uses `Song.PlayPosition`
+(Tracker §2.3); the delay is realised with the sub-tick note-delay countdown
+(Tracker §7.7) — the hit is staged with `DelaySamples` and fired inside `Work()`
+when the countdown reaches 0. `Humanize` adds non-cumulative jitter on top, so it
+never drifts tempo (Chord §3). Because it's a per-trigger delay rather than a step
 clock, it's tempo-locked and independent of the Sub-Tick Timing setting by
 construction (Chord §11.3) — no `SubTickInfo` read at all.
 
