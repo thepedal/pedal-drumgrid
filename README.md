@@ -52,14 +52,17 @@ deferred-trigger fade-cross (Tracker §4.2, §10).
 ## `.pdrumgrid.xml` kit file
 
 A kit bundles, per lane: a sample source and lane defaults (velocity, pitch,
-choke group, root note). **Save Kit embeds the actual audio** (16-bit PCM WAV,
+choke group, root note). **Save Kit embeds the actual audio** (PCM/float WAV,
 base64) so a kit is fully self-contained — no external files or wavetable slots
-needed to share or reload it. Three source kinds are understood on load:
+needed to share or reload it. The embed keeps each sample's **native bit depth
+and sample rate** (16/24/32-bit int or 32-bit float) rather than flattening to
+16-bit, so high-resolution sources aren't degraded. Three source kinds are
+understood on load:
 
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
 <PedalDrumGrid version="2" name="808 Core">
-  <!-- embedded: what Save Kit writes — audio baked in (base64 16-bit WAV) -->
+  <!-- embedded: what Save Kit writes — audio baked in (base64 WAV, native format) -->
   <Lane index="0" name="Kick">
     <Sample kind="embedded" rootNote="60">UklGRiQAAABXQVZF…(base64)…</Sample>
     <Defaults velocity="127" pitch="0" chokeGroup="0" out="1" />
@@ -77,9 +80,10 @@ needed to share or reload it. Three source kinds are understood on load:
 </PedalDrumGrid>
 ```
 
-- `kind="embedded"` — base64 16-bit PCM WAV, decoded at load. The output of
-  Save Kit (it encodes each lane's in-memory snapshot via `WavWriter`,
-  whatever the lane's original source). Self-contained.
+- `kind="embedded"` — base64 PCM/float WAV, decoded at load. The output of
+  Save Kit (it encodes each lane's in-memory snapshot via `WavWriter` at the
+  source's native bit depth / sample rate, whatever the lane's original source).
+  Self-contained.
 - `kind="file"` — PCM wav read at load (`WavReader`); for non-wav, import into
   the wavetable first and use `wavetable`.
 - `kind="wavetable"` — `waveIndex` is a 1-based ReBuzz wavetable slot, read live

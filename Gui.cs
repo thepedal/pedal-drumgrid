@@ -27,6 +27,7 @@ namespace PedalDrumGrid
         readonly ComboBox[] _laneCombo = new ComboBox[PedalDrumGridMachine.LANES];
         readonly ComboBox[] _laneOutCombo = new ComboBox[PedalDrumGridMachine.LANES];
         readonly TextBlock[] _laneStatus = new TextBlock[PedalDrumGridMachine.LANES];
+        readonly TextBlock[] _laneFormat = new TextBlock[PedalDrumGridMachine.LANES];
         bool _populating;
 
         public IMachine Machine
@@ -92,6 +93,7 @@ namespace PedalDrumGrid
                         _laneName[captured].Text = _machine.Kit.GetLaneName(captured);
                         _populating = false;
                         _laneStatus[captured].Text = _machine.Kit.LaneDisplay(captured);
+                        _laneFormat[captured].Text = _machine.Kit.LaneFormat(captured);
                     }
                 };
                 _laneCombo[lane] = combo;
@@ -125,6 +127,18 @@ namespace PedalDrumGrid
                 _laneStatus[lane] = status;
                 laneRow.Children.Add(status);
 
+                // Native sample-rate / bit-depth, to the right of the status.
+                var fmt = new TextBlock
+                {
+                    Margin = new Thickness(10, 0, 0, 0),
+                    Opacity = 0.6,
+                    Width = 64,
+                    FontFamily = new System.Windows.Media.FontFamily("Consolas"),
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                _laneFormat[lane] = fmt;
+                laneRow.Children.Add(fmt);
+
                 lanesPanel.Children.Add(laneRow);
             }
 
@@ -132,6 +146,8 @@ namespace PedalDrumGrid
             {
                 Content = lanesPanel,
                 VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+                MaxWidth = 560,   // keep the window compact; scroll right for the format column
                 MaxHeight = 360
             });
 
@@ -217,6 +233,7 @@ namespace PedalDrumGrid
 
                     _laneName[lane].Text = _machine.Kit.GetLaneName(lane);
                     _laneStatus[lane].Text = _machine.Kit.LaneDisplay(lane);
+                    _laneFormat[lane].Text = _machine.Kit.LaneFormat(lane);
                 }
             }
             finally { _populating = false; }

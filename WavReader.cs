@@ -74,6 +74,8 @@ namespace PedalDrumGrid
                 RootMidi   = rootNote,
                 DataL      = new float[frames + 1],
                 DataR      = stereo ? new float[frames + 1] : null,
+                SourceBits = bits,
+                SourceFloat = (fmtTag == 3),
             };
 
             int p = 0;

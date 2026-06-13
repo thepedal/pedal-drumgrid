@@ -15,6 +15,8 @@ namespace PedalDrumGrid
         public int     Length;
         public int     RootMidi;   // linear MIDI 0..127
         public int     SampleRate;
+        public int     SourceBits  = 16;     // native bit depth (8/16/24/32); preserved on embed
+        public bool    SourceFloat = false;  // true = IEEE float (32-bit)
     }
 
     // Lane source description.
@@ -83,6 +85,25 @@ namespace PedalDrumGrid
                 default: return "(empty)";
             }
             return string.IsNullOrEmpty(ls.Name) ? detail : ls.Name + " — " + detail;
+        }
+
+        // Concise sample-rate / bit-depth tag for the GUI, e.g. "44.1k/24",
+        // "48k/16", "44.1k/32f" (f = float). Empty for an unassigned lane. Reads
+        // the (cached) snapshot, so it reflects the source's native format.
+        public string LaneFormat(int lane)
+        {
+            if ((uint)lane >= _lanes.Length || _lanes[lane].Kind == LaneSourceKind.None) return "";
+            var snap = GetSnapshot(lane);
+            if (snap == null) return "";
+            string bits = snap.SourceFloat ? "32f" : snap.SourceBits.ToString();
+            return RateTag(snap.SampleRate) + "/" + bits;
+        }
+
+        static string RateTag(int hz)
+        {
+            if (hz <= 0) return "?";
+            double k = hz / 1000.0;
+            return (k == System.Math.Floor(k) ? k.ToString("0") : k.ToString("0.0")) + "k";
         }
 
         // ---- Per-lane velocity/pitch defaults (synced with the machine) -----
@@ -285,6 +306,7 @@ namespace PedalDrumGrid
             if (len <= 0) return null;
 
             bool stereo = (wave.Flags & WaveFlags.Stereo) != 0;   // Flags is on IWave, not IWaveLayer
+            var (wbits, wfloat) = WavetableFormat(layer, wave);
             var snap = new WaveSnapshot
             {
                 Length     = len,
@@ -293,10 +315,36 @@ namespace PedalDrumGrid
                 RootMidi   = BuzzByteToMidi(layer.RootNote),
                 DataL      = new float[len + 1],
                 DataR      = stereo ? new float[len + 1] : null,
+                SourceBits = wbits,
+                SourceFloat = wfloat,
             };
             layer.GetDataAsFloat(snap.DataL, 0, 1, 0, 0, len);
             if (stereo) layer.GetDataAsFloat(snap.DataR, 0, 1, 1, 0, len);
             return snap;
+        }
+
+        // The wavetable layer's native storage format (Tracker §7.3 WaveFormat:
+        // Int16 / Float32 / Int32 / Int24), read by reflection so there's no hard
+        // dependency on a member name across previews. Falls back to 32-bit float
+        // — lossless w.r.t. GetDataAsFloat — so a wavetable lane is never silently
+        // downconverted when the format can't be determined.
+        static (int bits, bool isFloat) WavetableFormat(object layer, object wave)
+        {
+            foreach (var o in new[] { layer, wave })
+            {
+                if (o == null) continue;
+                object v = null;
+                try { v = o.GetType().GetProperty("Format")?.GetValue(o); } catch { }
+                if (v == null) continue;
+                switch (v.ToString())
+                {
+                    case "Int16":   return (16, false);
+                    case "Int24":   return (24, false);
+                    case "Int32":   return (32, false);
+                    case "Float32": return (32, true);
+                }
+            }
+            return (32, true);
         }
 
         // ---- file read (basic PCM WAV) --------------------------------------
