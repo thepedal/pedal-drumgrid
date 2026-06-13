@@ -31,6 +31,7 @@ namespace PedalDrumGrid
         public int    ChokeGroup;
         public int    Velocity = 127; // per-lane default (0..127)
         public int    Pitch    = 0;   // per-lane default (semitones)
+        public int    Out      = 0;   // per-lane output bus (1-based); 0 = unspecified
         public WaveSnapshot Snapshot; // built lazily
     }
 
@@ -94,6 +95,16 @@ namespace PedalDrumGrid
             if ((uint)lane >= _lanes.Length) return;
             _lanes[lane].Velocity = velocity;
             _lanes[lane].Pitch = pitch;
+        }
+
+        // Per-lane output bus stored in the kit (1-based; 0 = the kit doesn't
+        // specify one, e.g. a pre-v1.5 file). The machine pushes its routing in
+        // before save and pulls it back after load.
+        public int GetLaneOut(int lane) =>
+            (uint)lane < _lanes.Length ? _lanes[lane].Out : 0;
+        public void SetLaneOut(int lane, int outBus)
+        {
+            if ((uint)lane < _lanes.Length) _lanes[lane].Out = outBus;
         }
 
         // ---- Lane-state persistence (MachineState v3 writes names) ---------
@@ -323,7 +334,7 @@ namespace PedalDrumGrid
                 foreach (var lane in _lanes)
                 {
                     lane.Kind = LaneSourceKind.None; lane.Snapshot = null; lane.Name = null;
-                    lane.EmbeddedWav = null; lane.Velocity = 127; lane.Pitch = 0; lane.ChokeGroup = 0;
+                    lane.EmbeddedWav = null; lane.Velocity = 127; lane.Pitch = 0; lane.ChokeGroup = 0; lane.Out = 0;
                 }
 
                 foreach (var laneEl in root.Elements("Lane"))
@@ -365,6 +376,7 @@ namespace PedalDrumGrid
                         ls.Velocity   = (int?)def.Attribute("velocity") ?? 127;
                         ls.Pitch      = (int?)def.Attribute("pitch") ?? 0;
                         ls.ChokeGroup = (int?)def.Attribute("chokeGroup") ?? 0;
+                        ls.Out        = (int?)def.Attribute("out") ?? 0;   // 0 if pre-v1.5
                     }
 
                     ls.Snapshot = null;   // rebuild lazily
@@ -413,7 +425,8 @@ namespace PedalDrumGrid
                 laneEl.Add(new XElement("Defaults",
                     new XAttribute("velocity", ls.Velocity),
                     new XAttribute("pitch", ls.Pitch),
-                    new XAttribute("chokeGroup", ls.ChokeGroup)));
+                    new XAttribute("chokeGroup", ls.ChokeGroup),
+                    new XAttribute("out", ls.Out)));
                 root.Add(laneEl);
             }
             new XDocument(new XDeclaration("1.0", "utf-8", null), root).Save(path);

@@ -9,8 +9,9 @@ namespace PedalDrumGrid
     // Pedal DrumGrid — multi-out drum-pattern sampler.
     //   * One pattern TRACK per drum lane; the pattern editor IS the trigger
     //     grid (bool Trigger -> ParameterType.Switch -> "1" fires, Core §9).
-    //   * Multi-out: out 0 = master sum, outs 1..LANES = per-lane dry
-    //     (Tracker §12). OutputCount declared with full headroom (§12.2).
+    //   * Multi-out: out 0 = master sum, outs 1..LANES = routable group
+    //     buses; each lane sums into one bus (default i->i+1), several lanes
+    //     can share one (Tracker §12). OutputCount has full headroom (§12.2).
     //   * Simultaneous same-step hits recovered via the shape-tolerant
     //     pvalues reader (Core §14/§42, Tracker §16) — load-bearing.
     //   * Swing = per-step trigger delay reusing Chord's ratio math (§3,§11).
@@ -39,6 +40,7 @@ namespace PedalDrumGrid
         readonly bool[] _hasTrig    = new bool[LANES];
         readonly bool[] _pendTrig   = new bool[LANES];
         readonly int[]  _pendVel    = new int[LANES];
+        readonly int[]  _humanizeVel = new int[LANES];  // 0..100 per lane, held; quieter-only velocity jitter
         readonly int[]  _basePitch  = new int[LANES];   // per-lane base tuning (from the kit)
         // Two command/argument slots per lane, captured per row at trigger time.
         readonly int[]  _cmd1 = new int[LANES];
@@ -58,11 +60,18 @@ namespace PedalDrumGrid
         // ---- the loaded kit / wavetable bridge ---------------------------
         readonly DrumKit _kit;
 
+        // ---- output routing ----------------------------------------------
+        //  Each lane is summed into one group bus (out 1..LANES). Default is the
+        //  1:1 mapping lane i -> out i+1; the GUI lets several lanes share a bus
+        //  (e.g. four hat lanes -> out 3). Out 0 is always the full master mix,
+        //  independent of grouping. Persisted in MachineState v4.
+        readonly int[] _laneOut = new int[LANES];
+
         // ---- globals -----------------------------------------------------
         int  _swing;        // 0..100
         int  _swingUnit;    // 0 = 1/8, 1 = 1/16
         int  _swingPhase;   // 0/1 which step of the pair is delayed
-        int  _humanize;     // 0..100
+        int  _humanize;     // 0..100, late-only timing jitter on every hit (master)
         int  _masterGain;   // 0..200, 100 = unity
 
         // ---- transport / row tracking ------------------------------------
@@ -81,6 +90,7 @@ namespace PedalDrumGrid
                 _trackL[t]  = new float[MAX_BLOCK];
                 _trackR[t]  = new float[MAX_BLOCK];
                 _pendVel[t] = 127;
+                _laneOut[t] = t + 1;          // default: lane i -> out i+1
             }
             ScheduleEnsureTracks();   // start with all 16 lanes' tracks (§ below)
         }
@@ -135,7 +145,10 @@ namespace PedalDrumGrid
         //  Off for release. The guarded calls compile out under `const false`
         //  (dead-code elimination), so there's zero runtime cost; flip to true
         //  to re-enable the trigger/assign/fire trace in the debug console.
-        const bool DBG = false;
+        // static readonly (not const) so the guarded `if (DBG) Dbg(...)` calls
+        // aren't compile-time-unreachable (CS0162). Flip to true to enable the
+        // DCWriteLine trace; the JIT elides the calls when false in Release.
+        static readonly bool DBG = false;
         bool _dbgWorkLogged;
         void Dbg(string s) { try { Buzz?.DCWriteLine("[DrumGrid] " + s); } catch { } }
 
@@ -144,8 +157,8 @@ namespace PedalDrumGrid
         // =================================================================
         //  COLUMN LAYOUT in the pattern editor (left -> right):
         //    [ Trig 1 .. Trig 16 ]   global switches  -> the trigger grid
-        //    [ Swing  Swing Phase  Humanize  Master Gain ]  other globals
-        //    [ per track: Velocity, Command 1, Argument 1, Command 2, Argument 2 ]
+        //    [ Swing  Swing Unit  Swing Phase  Humanize  Master Gain ]  other globals
+        //    [ per track: Velocity, Humanize Vel, Command 1, Argument 1, Command 2, Argument 2 ]
         //  (Per-lane wave assignment is GUI-only now, not a pattern column.)
         //
         //  Triggers MUST be globals, not track params: track params are laid
@@ -216,6 +229,11 @@ namespace PedalDrumGrid
                 int vv = _velPV(lane);
                 if (vv != _velParam.NoValue) _pendVel[lane] = vv;
             }
+            if (_hvelPV != null)                      // humanize-vel: held
+            {
+                int hv = _hvelPV(lane);
+                if (hv != _hvelParam.NoValue) _humanizeVel[lane] = hv;
+            }
             _cmd1[lane] = ReadMomentary(_cmd1Param, _cmd1PV, lane);   // commands: per-row
             _arg1[lane] = ReadMomentary(_arg1Param, _arg1PV, lane);
             _cmd2[lane] = ReadMomentary(_cmd2Param, _cmd2PV, lane);
@@ -231,32 +249,33 @@ namespace PedalDrumGrid
         }
 
         // ---- Other globals (auto-persisted by ReBuzz, Core §39.3) -----------
+        //  The swing group is declared together: Swing (amount), Swing Unit
+        //  (which note), Swing Phase (which side). Then Humanize, Master Gain.
 
         [ParameterDecl(Name = "Swing", MinValue = 0, MaxValue = 100, DefValue = 0,
             Description = "0 = straight, 100 ~ 2:1 shuffle. See Swing Unit / Swing Phase.")]
         public int Swing { get => _swing; set => _swing = value; }
+
+        // Note value the swing displaces, taken off the beat grid (TicksPerBeat)
+        // so it works at any pattern row resolution: 1/8 shuffles the off-beat
+        // eighths (the usual groove), 1/16 shuffles the off-beat sixteenths.
+        [ParameterDecl(Name = "Swing Unit", DefValue = 0,
+            ValueDescriptions = new[] { "1/8 (shuffle)", "1/16 (hat)" },
+            Description = "Note value the swing displaces")]
+        public int SwingUnit { get => _swingUnit; set => _swingUnit = value; }
 
         [ParameterDecl(Name = "Swing Phase", MinValue = 0, MaxValue = 1, DefValue = 0,
             Description = "0 = delay the off-beat (normal), 1 = delay the on-beat (drag)")]
         public int SwingPhase { get => _swingPhase; set => _swingPhase = value; }
 
         [ParameterDecl(Name = "Humanize", MinValue = 0, MaxValue = 100, DefValue = 0,
-            Description = "Timing jitter (non-cumulative)")]
+            Description = "Random late timing nudge on every hit (0..1/2 tick), non-cumulative")]
         public int Humanize { get => _humanize; set => _humanize = value; }
 
         [ParameterDecl(Name = "Master Gain", MinValue = 0, MaxValue = 200, DefValue = 100,
             Description = "Master mix gain on out 0 (100 = unity)")]
         public int MasterGain { get => _masterGain; set => _masterGain = value; }
 
-        // Appended after the original globals (not grouped with Swing) so existing
-        // songs keep their Swing Phase / Humanize / Master Gain indices. The note
-        // value the swing displaces, taken off the beat grid (TicksPerBeat) so it
-        // works at any pattern row resolution: 1/8 shuffles the off-beat eighths
-        // (the usual groove), 1/16 shuffles the off-beat sixteenths (hat swing).
-        [ParameterDecl(Name = "Swing Unit", DefValue = 0,
-            ValueDescriptions = new[] { "1/8 (shuffle)", "1/16 (hat)" },
-            Description = "Note value the swing displaces")]
-        public int SwingUnit { get => _swingUnit; set => _swingUnit = value; }
 
         // Per-lane wave assignment is NOT a parameter — it lives in the GUI
         // (kept off the pattern grid) and persists via MachineState. The kit is
@@ -300,12 +319,12 @@ namespace PedalDrumGrid
             return list;
         }
 
-        // ---- Track parameters (group 2): Velocity + 2 Command/Argument slots -
+        // ---- Track parameters (group 2): Velocity, Humanize Vel + 2 Cmd/Arg ---
         //  Rendered to the right of the global block, grouped per track:
-        //  [T0:Vel Cmd1 Arg1 Cmd2 Arg2][T1:...]...  Velocity is held; the
-        //  command slots are momentary (apply only on their row). Track index
-        //  t == lane t == output slot t+1. (The old dedicated Pitch column is
-        //  now command 05.)
+        //  [T0:Vel HumVel Cmd1 Arg1 Cmd2 Arg2][T1:...]...  Velocity and Humanize
+        //  Vel are held; the command slots are momentary (apply only on their
+        //  row). Track index t == lane t == output slot t+1. (The old dedicated
+        //  Pitch column is now command 05.)
 
         [ParameterDecl(Name = "Velocity", MinValue = 0, MaxValue = 127, DefValue = 127,
             Description = "Per-lane velocity (0..127), held until changed")]
@@ -313,6 +332,17 @@ namespace PedalDrumGrid
         {
             if ((uint)track >= LANES) return;
             _pendVel[track] = value;
+        }
+
+        // Per-track velocity humanize (held, like Velocity): random quieter-only
+        // drop applied to that lane's hits only, so you can loosen just a snare or
+        // one hat. 0 = exact. Re-read at trigger time in CaptureOwnLaneRow.
+        [ParameterDecl(Name = "Humanize Vel", MinValue = 0, MaxValue = 100, DefValue = 0,
+            Description = "Per-lane random velocity drop (0..1/2), held until changed")]
+        public void SetHumanizeVel(int value, int track)
+        {
+            if ((uint)track >= LANES) return;
+            _humanizeVel[track] = value;
         }
 
         // ValueDescriptions auto-sets Min=0, Max=length-1 and shows names in the
@@ -375,8 +405,8 @@ namespace PedalDrumGrid
         // Own-lane only (never siblings — that was the load-time clobber), and
         // never while stopped, so Core §14 collisions are a non-issue.
         bool _pollResolved, _pollFailed;
-        IParameter _velParam, _cmd1Param, _arg1Param, _cmd2Param, _arg2Param;
-        Func<int,int> _velPV, _cmd1PV, _arg1PV, _cmd2PV, _arg2PV;
+        IParameter _velParam, _hvelParam, _cmd1Param, _arg1Param, _cmd2Param, _arg2Param;
+        Func<int,int> _velPV, _hvelPV, _cmd1PV, _arg1PV, _cmd2PV, _arg2PV;
 
         bool EnsurePollFields()
         {
@@ -390,7 +420,8 @@ namespace PedalDrumGrid
                 {
                     switch (p.Name)
                     {
-                        case "Velocity":   _velParam  = p; _velPV  = GetPValuesReader(p); break;
+                        case "Velocity":     _velParam  = p; _velPV  = GetPValuesReader(p); break;
+                        case "Humanize Vel": _hvelParam = p; _hvelPV = GetPValuesReader(p); break;
                         case "Command 1":  _cmd1Param = p; _cmd1PV = GetPValuesReader(p); break;
                         case "Argument 1": _arg1Param = p; _arg1PV = GetPValuesReader(p); break;
                         case "Command 2":  _cmd2Param = p; _cmd2PV = GetPValuesReader(p); break;
@@ -450,34 +481,42 @@ namespace PedalDrumGrid
 
             if (newRow) ApplyPendingTriggers(songPos);
 
-            // Render each lane into its own scratch, advancing delays/voices.
+            // Render and mix only the lanes that actually have something to play.
+            // Idle lanes are skipped entirely — no render, no clear, no sum — which
+            // is the main saving when the kit is sparse. Out 0 = full mix (×master
+            // gain); outs 1..LANES = dry group buses. We zero the connected output
+            // buffers once, then each active lane adds into master and its bus in a
+            // single pass.
+            int er = EngineRate();
+            float mgScale = (_masterGain / 100f) * OUT_SCALE;
+
+            var master = output.Count > 0 ? output[0] : null;
+            if (master != null)
+                for (int i = 0; i < n; i++) { master[i].L = 0f; master[i].R = 0f; }
+            for (int g = 1; g <= LANES; g++)
+            {
+                var ob = (g < output.Count) ? output[g] : null;
+                if (ob == null) continue;                       // unconnected (§12.1)
+                for (int i = 0; i < n; i++) { ob[i].L = 0f; ob[i].R = 0f; }
+            }
+
             for (int t = 0; t < LANES; t++)
             {
                 var v = _voices[t];
-                v.Render(_trackL[t], _trackR[t], n, _kit.GetSnapshot(t), EngineRate());
-            }
+                if (!v.Active) continue;                        // nothing to do for this lane
 
-            // Publish out 0 = summed master (with master gain), outs 1..N dry.
-            float mg = _masterGain / 100f;
-            if (output[0] != null)
-            {
-                var o = output[0];
+                var tl = _trackL[t]; var tr = _trackR[t];
+                v.Render(tl, tr, n, er);
+
+                int g = _laneOut[t];
+                var bus = (g >= 1 && g < output.Count) ? output[g] : null;
+                if (master == null && bus == null) continue;    // state advanced, nowhere to send
+
                 for (int i = 0; i < n; i++)
                 {
-                    float l = 0f, r = 0f;
-                    for (int t = 0; t < LANES; t++) { l += _trackL[t][i]; r += _trackR[t][i]; }
-                    o[i].L = l * mg * OUT_SCALE;
-                    o[i].R = r * mg * OUT_SCALE;
-                }
-            }
-            for (int t = 0; t < LANES; t++)
-            {
-                var o = (t + 1 < output.Count) ? output[t + 1] : null;
-                if (o == null) continue;                 // unconnected slot (§12.1)
-                for (int i = 0; i < n; i++)
-                {
-                    o[i].L = _trackL[t][i] * OUT_SCALE;   // per-lane DRY (§12.3)
-                    o[i].R = _trackR[t][i] * OUT_SCALE;
+                    float l = tl[i], r = tr[i];
+                    if (master != null) { master[i].L += l * mgScale;   master[i].R += r * mgScale; }
+                    if (bus    != null) { bus[i].L    += l * OUT_SCALE;  bus[i].R    += r * OUT_SCALE; }
                 }
             }
             return true;
@@ -499,7 +538,8 @@ namespace PedalDrumGrid
                 var snap = _kit.GetSnapshot(t);
                 if (snap == null) continue;
 
-                var spec = BuildSpec(t, SwingDelaySamples(songPos, spt), spt, subSamples);
+                int baseDelay = SwingDelaySamples(songPos, spt) + HumanizeDelaySamples(spt);
+                var spec = BuildSpec(t, baseDelay, spt, subSamples);
                 if (DBG) Dbg($"fire lane={t} vel={_pendVel[t]} pitch={spec.PitchSemis} off={spec.StartOffset:0.00} rev={spec.Reverse} cut={spec.CutSamples} rtg={spec.RetrigInterval}/{spec.RetrigLength}");
                 ChokeGroupCut(t);
                 _voices[t].Trigger(in spec, snap);
@@ -516,15 +556,15 @@ namespace PedalDrumGrid
         // Translate a lane's two command slots into a voice TrigSpec. Cmd1 then
         // Cmd2 — the second slot wins on conflicting fields (e.g. two Offsets),
         // independent fields (Pitch + Delay) combine.
-        TrigSpec BuildSpec(int lane, int swingDelay, int spt, int subSamples)
+        TrigSpec BuildSpec(int lane, int baseDelay, int spt, int subSamples)
         {
             var s = new TrigSpec
             {
-                VelGain      = _pendVel[lane] / 127f,
+                VelGain      = HumanizedGain(_pendVel[lane], lane),
                 PitchSemis   = _basePitch[lane],   // kit base tuning; Pitch cmd adds to it
                 StartOffset  = 0f,
                 Reverse      = false,
-                DelaySamples = swingDelay,
+                DelaySamples = baseDelay,
                 CutSamples   = 0,
                 RetrigInterval = 0,
                 RetrigLength   = 0,
@@ -589,13 +629,32 @@ namespace PedalDrumGrid
             double ratio = 1.0 + _swing / 100.0;                 // 1..2
             double frac  = 2.0 * ratio / (ratio + 1.0) - 1.0;    // 0..0.333 of the unit
             int delay = (int)Math.Round(frac * rowsPerStep * samplesPerTick);
-            if (_humanize > 0)
-            {
-                int drift = (int)Math.Round(samplesPerTick * _humanize / 200.0);
-                if (drift > 0) delay += _rng.Next(0, drift + 1);
-            }
             if (delay < 0) delay = 0;
             return delay;
+        }
+
+        // Timing humanize, applied to EVERY hit (not just swung off-beats) on top
+        // of any swing/command delay. Late-only: a uniform random push of 0..drift
+        // samples, drift = half a tick at 100. Recomputed per hit, so non-
+        // cumulative (the grid never drifts).
+        int HumanizeDelaySamples(int spt)
+        {
+            if (_humanize <= 0) return 0;
+            int drift = (int)Math.Round(spt * _humanize / 200.0);
+            return drift > 0 ? _rng.Next(0, drift + 1) : 0;
+        }
+
+        // Velocity humanize: reduce the hit's gain by a random fraction of its own
+        // velocity, up to half at 100. Quieter-only (mirrors the late-only timing),
+        // proportional so quiet hits stay audible and a hit is never fully muted.
+        // Per lane, so only the lanes you set are loosened.
+        float HumanizedGain(int vel, int lane)
+        {
+            int hv = _humanizeVel[lane];
+            if (hv <= 0) return vel / 127f;
+            int range = (int)Math.Round(vel * hv / 200.0);
+            int v = vel - (range > 0 ? _rng.Next(0, range + 1) : 0);
+            return (v < 0 ? 0 : v) / 127f;
         }
 
         void ChokeGroupCut(int firingLane)
@@ -630,9 +689,12 @@ namespace PedalDrumGrid
         // =================================================================
         //  STATE PERSISTENCE (Core §39 framing)
         // =================================================================
-        // v3 adds per-lane names. v2 (no names) and v1 (path only) still read.
+        // v6: MachineState is kit + per-lane output routing. (The short-lived v5
+        // master velocity-humanize byte is gone — Humanize Vel is now a per-track
+        // pattern parameter, not machine state.) Reader accepts v1..v6; a v5 state
+        // simply has a trailing humanize byte that we leave unread.
         const uint MAGIC = 0x44475250u;   // "PRGD"
-        const byte VERSION = 3;
+        const byte VERSION = 6;
 
         public byte[] MachineState
         {
@@ -649,6 +711,7 @@ namespace PedalDrumGrid
                     bw.Write((ushort)pb.Length);
                     bw.Write(pb);
                     _kit.WriteLanes(bw);          // full per-lane source state
+                    for (int t = 0; t < LANES; t++) bw.Write((byte)_laneOut[t]);   // v4+ routing
                     return ms.ToArray();
                 }
                 catch { return Array.Empty<byte>(); }
@@ -662,7 +725,7 @@ namespace PedalDrumGrid
                     using var br = new System.IO.BinaryReader(ms);
                     if (br.ReadUInt32() != MAGIC) return;
                     byte v = br.ReadByte();
-                    if (v < 1 || v > 3) return;            // unknown future version
+                    if (v < 1 || v > 6) return;            // unknown future version
                     int len = br.ReadUInt16();
                     string kitPath = System.Text.Encoding.UTF8.GetString(br.ReadBytes(len));
                     _kit.SetActiveKitPath(string.IsNullOrEmpty(kitPath) ? null : kitPath);
@@ -670,6 +733,10 @@ namespace PedalDrumGrid
                         _kit.ReadLanes(br, withNames: v >= 3);   // self-contained lane state
                     else if (!string.IsNullOrEmpty(kitPath))
                         _kit.LoadFromFile(kitPath);        // v1: reload from file
+                    if (v >= 4)
+                        for (int t = 0; t < LANES; t++)
+                            _laneOut[t] = Math.Min(LANES, Math.Max(1, (int)br.ReadByte()));
+                    // v5's trailing master-humanize byte (if present) is ignored.
                     _kit.PrebuildAll();                    // decode off the audio thread
                 }
                 catch { /* corrupt — start fresh */ }
@@ -680,9 +747,19 @@ namespace PedalDrumGrid
         public DrumKit Kit => _kit;
         public IBuzzMachineHost Host => host;
 
-        // Kit load/save routed through the machine so per-lane velocity and the
-        // base tuning (_pendVel/_basePitch) round-trip with the kit file. The
-        // base tuning is added to every hit; the Pitch command (05) adjusts per row.
+        // Output routing (1-based bus, 1..LANES). The GUI reads/writes these.
+        public int GetLaneOut(int lane) => (lane >= 0 && lane < LANES) ? _laneOut[lane] : lane + 1;
+        public void SetLaneOut(int lane, int outBus)
+        {
+            if (lane < 0 || lane >= LANES) return;
+            _laneOut[lane] = Math.Min(LANES, Math.Max(1, outBus));
+        }
+
+
+        // Kit load/save routed through the machine so per-lane velocity, base
+        // tuning (_pendVel/_basePitch) and output routing (_laneOut) round-trip
+        // with the kit file. Base tuning is added to every hit; the Pitch command
+        // (05) adjusts per row.
         public void LoadKit(string path)
         {
             _kit.LoadFromFile(path);
@@ -690,13 +767,18 @@ namespace PedalDrumGrid
             {
                 _pendVel[t]   = _kit.GetLaneVelocity(t);
                 _basePitch[t] = _kit.GetLanePitch(t);
+                int o = _kit.GetLaneOut(t);          // only override when the kit
+                if (o >= 1 && o <= LANES) _laneOut[t] = o;   // specifies a bus (pre-v1.5 = 0 -> keep current)
             }
         }
 
         public void SaveKit(string path)
         {
             for (int t = 0; t < LANES; t++)
+            {
                 _kit.SetLaneDefaults(t, _pendVel[t], _basePitch[t]);
+                _kit.SetLaneOut(t, _laneOut[t]);
+            }
             _kit.SaveToFile(path);
         }
     }

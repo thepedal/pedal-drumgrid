@@ -136,11 +136,13 @@ namespace PedalDrumGrid
         public void Choke()    { if (_active) _target = 0f; _retrigInterval = 0; }
         public void StopFade() { _target = 0f; _delaySamples = 0; _pendStaged = false; _retrigInterval = 0; _cutCountdown = -1; }
 
-        public void Render(float[] outL, float[] outR, int n, WaveSnapshot live, int engineRate)
+        public void Render(float[] outL, float[] outR, int n, int engineRate)
         {
             Array.Clear(outL, 0, n);
             Array.Clear(outR, 0, n);
             if (!_active && !_pendStaged && _delaySamples <= 0 && _retrigInterval <= 0) return;
+
+            double srInv = 1.0 / engineRate;   // fold the SR ratio with a multiply, not a per-sample divide
 
             for (int i = 0; i < n; i++)
             {
@@ -180,8 +182,8 @@ namespace PedalDrumGrid
                 var s = _snap;
                 if (s == null) { _active = false; return; }
 
-                // end-of-sample by direction
-                bool ended = _dir > 0 ? (int)_pos >= s.Length - 1 : _pos <= 0.0;
+                int idx = (int)_pos;
+                bool ended = _dir > 0 ? idx >= s.Length - 1 : _pos <= 0.0;
                 if (ended)
                 {
                     _active = false;
@@ -191,9 +193,8 @@ namespace PedalDrumGrid
                 }
                 else
                 {
-                    int idx = (int)_pos;
                     if (idx < 0) idx = 0;
-                    if (idx > s.Length - 2) idx = s.Length - 2;
+                    else if (idx > s.Length - 2) idx = s.Length - 2;
                     float frac = (float)(_pos - idx);
                     float l = Lerp(s.DataL[idx], s.DataL[idx + 1], frac);
                     float r = s.Stereo ? Lerp(s.DataR[idx], s.DataR[idx + 1], frac) : l;
@@ -205,10 +206,15 @@ namespace PedalDrumGrid
                     outL[i] = l * g;
                     outR[i] = r * g;
 
-                    double inc = _inc * (s.SampleRate / (double)engineRate);
-                    _pos += _dir > 0 ? inc : -inc;
+                    _pos += _dir * _inc * s.SampleRate * srInv;   // _dir is +1/-1 → branchless step
 
-                    if (_pendStaged && _gain <= NEAR_ZERO && _target == 0f) FireStaged();
+                    // Faded out: fire a staged hit, else stop rendering this voice
+                    // so a choked/cut tail doesn't read silently to end-of-sample.
+                    if (_target == 0f && _gain <= NEAR_ZERO)
+                    {
+                        if (_pendStaged) FireStaged();
+                        else if (_retrigInterval <= 0) _active = false;
+                    }
                 }
             }
         }

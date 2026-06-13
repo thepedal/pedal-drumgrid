@@ -25,6 +25,7 @@ namespace PedalDrumGrid
         TextBlock _kitLabel;
         readonly TextBox[] _laneName = new TextBox[PedalDrumGridMachine.LANES];
         readonly ComboBox[] _laneCombo = new ComboBox[PedalDrumGridMachine.LANES];
+        readonly ComboBox[] _laneOutCombo = new ComboBox[PedalDrumGridMachine.LANES];
         readonly TextBlock[] _laneStatus = new TextBlock[PedalDrumGridMachine.LANES];
         bool _populating;
 
@@ -79,7 +80,7 @@ namespace PedalDrumGrid
                 _laneName[lane] = nameBox;
                 laneRow.Children.Add(nameBox);
 
-                var combo = new ComboBox { Width = 200, VerticalAlignment = VerticalAlignment.Center };
+                var combo = new ComboBox { Width = 180, VerticalAlignment = VerticalAlignment.Center };
                 combo.SelectionChanged += (_, __) =>
                 {
                     if (_populating || _machine == null) return;
@@ -96,10 +97,29 @@ namespace PedalDrumGrid
                 _laneCombo[lane] = combo;
                 laneRow.Children.Add(combo);
 
+                // Output bus picker — which multi-out this lane sums into.
+                laneRow.Children.Add(new TextBlock
+                {
+                    Text = "\u2192",   // arrow
+                    Margin = new Thickness(6, 0, 4, 0),
+                    VerticalAlignment = VerticalAlignment.Center
+                });
+                var outCombo = new ComboBox { Width = 70, VerticalAlignment = VerticalAlignment.Center };
+                outCombo.SelectionChanged += (_, __) =>
+                {
+                    if (_populating || _machine == null) return;
+                    if (outCombo.SelectedIndex >= 0)
+                        _machine.SetLaneOut(captured, outCombo.SelectedIndex + 1);
+                };
+                _laneOutCombo[lane] = outCombo;
+                laneRow.Children.Add(outCombo);
+
                 var status = new TextBlock
                 {
                     Margin = new Thickness(8, 0, 0, 0),
                     Opacity = 0.7,
+                    Width = 150,
+                    TextTrimming = TextTrimming.CharacterEllipsis,
                     VerticalAlignment = VerticalAlignment.Center
                 };
                 _laneStatus[lane] = status;
@@ -119,9 +139,13 @@ namespace PedalDrumGrid
             {
                 Margin = new Thickness(0, 8, 0, 0),
                 Opacity = 0.7,
+                Width = 560,
+                HorizontalAlignment = HorizontalAlignment.Left,
                 TextWrapping = TextWrapping.Wrap,
                 Text = "Assign a wavetable wave per lane here (or load a .pdrumgrid.xml kit). " +
-                       "Triggers go in the pattern editor — one Trig column per lane, type 1 to hit."
+                       "The \u2192 Out picker routes each lane to a multi-out bus — point several " +
+                       "lanes at the same bus to group them (e.g. all hats \u2192 Out 3). Out 0 is the " +
+                       "full mix. Triggers go in the pattern editor — one Trig column per lane, type 1 to hit."
             });
 
             Content = root;
@@ -180,6 +204,16 @@ namespace PedalDrumGrid
                     for (int i = 0; i < entries.Count; i++)
                         if (entries[i].Index == want) { sel = i; break; }
                     combo.SelectedIndex = sel;
+
+                    // Output bus list (Out 1..LANES), select this lane's routing.
+                    var oc = _laneOutCombo[lane];
+                    if (oc.Items.Count != PedalDrumGridMachine.LANES)
+                    {
+                        var buses = new List<string>(PedalDrumGridMachine.LANES);
+                        for (int b = 1; b <= PedalDrumGridMachine.LANES; b++) buses.Add("Out " + b);
+                        oc.ItemsSource = buses;
+                    }
+                    oc.SelectedIndex = _machine.GetLaneOut(lane) - 1;
 
                     _laneName[lane].Text = _machine.Kit.GetLaneName(lane);
                     _laneStatus[lane].Text = _machine.Kit.LaneDisplay(lane);
