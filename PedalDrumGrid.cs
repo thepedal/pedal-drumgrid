@@ -479,7 +479,23 @@ namespace PedalDrumGrid
             bool newRow = songPos != _prevSongPos;
             _prevSongPos = songPos;
 
-            if (newRow) ApplyPendingTriggers(songPos);
+            // Fire pending hits on the row edge AND whenever they arrive mid-row.
+            // The Modern Pattern Editor writes a row's values during its own Work,
+            // one Play call after the tick starts, then forces delivery with
+            // SendControlChanges. So the setters land after the Work that saw the
+            // row edge. Gating on newRow alone held every hit until the NEXT row:
+            // exactly one tick late. Mid-row, the time already elapsed in the row
+            // is taken off the hit's delay, so swing and Delay commands stay
+            // anchored to the row start.
+            // Only while playing: when stopped, pending hits keep the pre-1.5.2
+            // behaviour (held until the transport moves) so nothing changes there.
+            if (newRow || (_wasPlaying && AnyTrigPending()))
+            {
+                int elapsed = 0;
+                if (!newRow)
+                    try { elapsed = Math.Max(0, host?.MasterInfo?.PosInTick ?? 0); } catch { }
+                ApplyPendingTriggers(songPos, elapsed);
+            }
 
             // Render and mix only the lanes that actually have something to play.
             // Idle lanes are skipped entirely — no render, no clear, no sum — which
@@ -522,10 +538,18 @@ namespace PedalDrumGrid
             return true;
         }
 
+        bool AnyTrigPending()
+        {
+            for (int t = 0; t < LANES; t++)
+                if (_hasTrig[t]) return true;
+            return false;
+        }
+
         // Apply this row's pending hits, scheduling swing delay on off-beats.
+        // elapsed = samples already played in this row (0 on the row edge).
         // Then, for any lane mid-retrigger that did NOT fire this row, read the
         // row's Pitch command and steer the ongoing roll (v1.2).
-        void ApplyPendingTriggers(int songPos)
+        void ApplyPendingTriggers(int songPos, int elapsed)
         {
             int spt = SamplesPerTick();
             int subSamples = Math.Max(1, spt / SUBTICKS_PER_TICK);
@@ -540,6 +564,7 @@ namespace PedalDrumGrid
 
                 int baseDelay = SwingDelaySamples(songPos, spt) + HumanizeDelaySamples(spt);
                 var spec = BuildSpec(t, baseDelay, spt, subSamples);
+                spec.DelaySamples = Math.Max(0, spec.DelaySamples - elapsed);
                 if (DBG) Dbg($"fire lane={t} vel={_pendVel[t]} pitch={spec.PitchSemis} off={spec.StartOffset:0.00} rev={spec.Reverse} cut={spec.CutSamples} rtg={spec.RetrigInterval}/{spec.RetrigLength}");
                 ChokeGroupCut(t);
                 _voices[t].Trigger(in spec, snap);

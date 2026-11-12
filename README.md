@@ -7,7 +7,7 @@ per-lane Velocity, per-lane Humanize Vel, and two tracker-style **Command/Argume
 effect columns (v1.1). Samples come from the ReBuzz wavetable (assigned per lane in the
 GUI) or from a self-contained `.pdrumgrid.xml` kit with embedded audio.
 
-Status: **v1.5** — multi-out triggering with **per-lane output routing** (group
+Status: **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
 several lanes onto one bus), grid-aware swing (`Swing Unit` 1/8 or 1/16),
 master `Humanize` (late-only timing on every hit) and **per-track `Humanize Vel`**
 (quieter-only velocity scatter on chosen lanes), kit load/save with embedded
@@ -149,6 +149,32 @@ the pattern's row resolution. Off-beat selection uses `Song.PlayPosition`
 when the countdown reaches 0. Because it's a per-trigger delay rather than a step
 clock, it's tempo-locked and independent of the Sub-Tick Timing setting by
 construction (Chord §11.3) — no `SubTickInfo` read at all.
+
+---
+
+## Trigger timing (v1.5.2)
+
+Hits used to fire only on the **row edge**, the first `Work()` that sees
+`Song.PlayPosition` change. The Modern Pattern Editor doesn't deliver a row's
+values before that `Work()`. It plays the window `[previous, current)` in its own
+`Work()`, one Play call into the tick, and then forces delivery with
+`SendControlChanges`. So the `Trig` setters arrived after the row edge, and every
+hit waited for the *next* row: **exactly one tick late** (measured: +1.003 tick at
+126 BPM / 48 kHz, while native synths fed from the same editor land about 6 ms
+after the tick).
+
+v1.5.2 fires pending hits on the row edge **or** in the first `Work()` after they
+arrive while playing. When it fires mid-row it subtracts the samples already played
+in the row (`MasterInfo.PosInTick`) from the hit's delay (swing + humanize + Delay
+command, clamped at 0). Swing and Delay therefore still count from the row start,
+and a hit now lands within about one audio chunk of its row, like the native
+machines.
+
+**Compatibility.** No parameter, `MachineState` or kit-format change, so songs and
+kits from any earlier version load unchanged. When setters arrive on the row edge
+the behaviour is identical to before. While stopped, pending hits are still held
+until the transport moves, as before. The only audible change: drums in existing
+songs play one tick earlier, which is where they were written.
 
 ---
 
