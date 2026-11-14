@@ -24,12 +24,52 @@ namespace PedalDrumGrid
         OutputCount = PedalDrumGridMachine.LANES + 1)]   // +1 master (§12.2)
     public class PedalDrumGridMachine : IBuzzMachine
     {
+        // Single source of truth for the version (AboutWindow §1.3). Bump here.
+        internal const string Version = "1.5.4";
+
         public const int LANES        = 16;
         public const int MAX_BLOCK    = 4096;            // generous scratch (§12.5)
         public const float OUT_SCALE  = 32768f;          // float ±1 -> Buzz ±32768 (Core §38)
 
         readonly IBuzzMachineHost host;
         IBuzz Buzz => host?.Machine?.Graph?.Buzz;
+
+        // ---- right-click menu: About (AboutWindow §1.4) -----------------
+        //  ReBuzz finds this by reflection (exact name, public getter). Types
+        //  are fully qualified so no new usings can collide with existing names.
+        public IEnumerable<IMenuItem> Commands
+        {
+            get
+            {
+                yield return new BuzzGUI.Common.MenuItemVM()
+                {
+                    Text = "About...",
+                    Command = new BuzzGUI.Common.SimpleCommand()
+                    {
+                        CanExecuteDelegate = p => true,
+                        ExecuteDelegate    = p => System.Windows.MessageBox.Show(AboutText(), "About Pedal DrumGrid")
+                    }
+                };
+            }
+        }
+
+        // Version plus the path and timestamp of the dll actually loaded, so a
+        // stale deploy (ReBuzz holding the old file open) is obvious at a glance.
+        static string AboutText()
+        {
+            string where = "";
+            try
+            {
+                string loc = typeof(PedalDrumGridMachine).Assembly.Location;
+                if (!string.IsNullOrEmpty(loc))
+                    where = "\n\nLoaded from:\n" + loc +
+                            "\nBuilt: " + System.IO.File.GetLastWriteTime(loc).ToString("yyyy-MM-dd HH:mm:ss");
+            }
+            catch { }
+            return "Pedal DrumGrid   v" + Version + "\n\n" +
+                   "16-lane multi-out drum-pattern sampler for ReBuzz.\n\n" +
+                   "github.com/thepedal/pedal-drumgrid" + where;
+        }
 
         // ---- per-lane voices + per-lane stereo scratch -------------------
         readonly Voice[]  _voices  = new Voice[LANES];
@@ -72,7 +112,7 @@ namespace PedalDrumGrid
         int  _swingUnit;    // 0 = 1/8, 1 = 1/16
         int  _swingPhase;   // 0/1 which step of the pair is delayed
         int  _humanize;     // 0..100, late-only timing jitter on every hit (master)
-        int  _masterGain;   // 0..200, 100 = unity
+        int  _masterGain;   // 0..254, 100 = unity (254 = +8.1 dB)
 
         // ---- transport / row tracking ------------------------------------
         int  _prevSongPos = int.MinValue;
@@ -272,8 +312,8 @@ namespace PedalDrumGrid
             Description = "Random late timing nudge on every hit (0..1/2 tick), non-cumulative")]
         public int Humanize { get => _humanize; set => _humanize = value; }
 
-        [ParameterDecl(Name = "Master Gain", MinValue = 0, MaxValue = 200, DefValue = 100,
-            Description = "Gain on the mix (out 0) and all group buses (100 = unity, 200 = +6 dB)")]
+        [ParameterDecl(Name = "Master Gain", MinValue = 0, MaxValue = 254, DefValue = 100,
+            Description = "Gain on the mix (out 0) and all group buses (100 = unity, 200 = +6 dB, 254 = +8.1 dB)")]
         public int MasterGain { get => _masterGain; set => _masterGain = value; }
 
 

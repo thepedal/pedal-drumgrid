@@ -7,7 +7,7 @@ per-lane Velocity, per-lane Humanize Vel, and two tracker-style **Command/Argume
 effect columns (v1.1). Samples come from the ReBuzz wavetable (assigned per lane in the
 GUI) or from a self-contained `.pdrumgrid.xml` kit with embedded audio.
 
-Status: **v1.5.3** (Master Gain now also scales the group buses, see below) — **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
+Status: **v1.5.4** (Master Gain range raised to 254, About command, see below) — **v1.5.3** (Master Gain now also scales the group buses, see below) — **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
 several lanes onto one bus), grid-aware swing (`Swing Unit` 1/8 or 1/16),
 master `Humanize` (late-only timing on every hit) and **per-track `Humanize Vel`**
 (quieter-only velocity scatter on chosen lanes), kit load/save with embedded
@@ -192,6 +192,24 @@ v1.5.3 applies Master Gain to out 0 and to every bus.
 unchanged. Bus levels change only where Master Gain is not 100: they move by
 the Master Gain amount (+6 dB at 200), so trim downstream gains or compressor
 thresholds that were set against the old bus level.
+
+---
+
+## Master Gain range and About (v1.5.4)
+
+**Master Gain now runs 0..254** (was 0..200); 100 is still unity, 200 is +6 dB
+and 254 is +8.1 dB. 254 is the ceiling for a byte parameter because 255 is the
+no-value sentinel. The extra range lets a SampleGrid conversion that needs more
+than 2.0 (e.g. 2.25 = Master Gain 225) reach its original level.
+
+**About...** in the machine's right-click menu (Machine View) shows the version,
+the path of the dll ReBuzz actually loaded and that file's timestamp, so a stale
+deploy is easy to spot. The version lives in one constant,
+`PedalDrumGridMachine.Version`.
+
+**Compatibility.** Same parameters in the same order; only one maximum changed.
+No `MachineState` or kit-format change. A song saved with Master Gain above 200
+will be out of range for v1.5.3 and earlier.
 
 ---
 
