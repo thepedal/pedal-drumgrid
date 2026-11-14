@@ -7,7 +7,7 @@ per-lane Velocity, per-lane Humanize Vel, and two tracker-style **Command/Argume
 effect columns (v1.1). Samples come from the ReBuzz wavetable (assigned per lane in the
 GUI) or from a self-contained `.pdrumgrid.xml` kit with embedded audio.
 
-Status: **v1.6.0** (per-output mutes for outs 1..8; **parameter layout change**, see below) — **v1.5.4** (Master Gain range raised to 254, About command, see below) — **v1.5.3** (Master Gain now also scales the group buses, see below) — **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
+Status: **v1.6.1** (a muted out is now also silent in the out 0 mix) — **v1.6.0** (per-output mutes for outs 1..8; **parameter layout change**, see below) — **v1.5.4** (Master Gain range raised to 254, About command, see below) — **v1.5.3** (Master Gain now also scales the group buses, see below) — **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
 several lanes onto one bus), grid-aware swing (`Swing Unit` 1/8 or 1/16),
 master `Humanize` (late-only timing on every hit) and **per-track `Humanize Vel`**
 (quieter-only velocity scatter on chosen lanes), kit load/save with embedded
@@ -214,17 +214,19 @@ will be out of range for v1.5.3 and earlier.
 
 ---
 
-## Output mutes (v1.6.0)
+## Output mutes (v1.6.0, v1.6.1)
 
 Eight new global switches, **Mute Out 1 .. Mute Out 8**, one per group bus on
 outs 1..8. They are ordinary held parameters: saved with the song, shown in the
 parameter window, usable as pattern columns (1 = mute, 0 = unmute) and
 MIDI-bindable. Outs 9..16 have no mute.
 
-- A mute silences **the bus only**. Out 0 still carries the full kit.
-- The mute acts on the summed bus, so every lane routed to that out is muted
-  together. Voices keep playing underneath, so unmuting mid-sample lets the tail
-  through.
+- A mute silences every lane routed to that out, **on the bus and in the out 0
+  mix** (v1.6.1), like a mixer channel mute. v1.6.0 muted the bus only. It works
+  whether or not the bus itself is connected, so it also serves as a group mute
+  when only out 0 is wired.
+- Lanes routed to outs 9..16 are never muted. Voices keep playing underneath, so
+  unmuting mid-sample lets the tail through.
 - The gain ramps over about 5 ms each way, so toggling never clicks.
 
 Column order is now `[Trig 1..16][Swing  Swing Unit  Swing Phase  Humanize

@@ -25,7 +25,7 @@ namespace PedalDrumGrid
     public class PedalDrumGridMachine : IBuzzMachine
     {
         // Single source of truth for the version (AboutWindow §1.3). Bump here.
-        internal const string Version = "1.6.0";
+        internal const string Version = "1.6.1";
 
         public const int LANES        = 16;
         public const int MUTE_OUTS    = 8;               // Mute Out 1..8 (outs 1..8 only)
@@ -115,11 +115,13 @@ namespace PedalDrumGrid
         int  _humanize;     // 0..100, late-only timing jitter on every hit (master)
         int  _masterGain;   // 0..254, 100 = unity (254 = +8.1 dB)
 
-        // ---- per-bus mutes (v1.6.0): outs 1..MUTE_OUTS, index = out number --
-        //  _busMute is the parameter state; _busGain is the smoothed 0..1 gain
-        //  the audio thread ramps toward it (~5 ms) so a mute never clicks.
+        // ---- output mutes (v1.6.0; v1.6.1 also mutes the lanes in out 0) ----
+        //  Outs 1..MUTE_OUTS, index = out number. _busMute is the parameter
+        //  state; _busGain is the smoothed 0..1 gain the audio thread ramps
+        //  toward it (~5 ms) so a mute never clicks.
         readonly bool[]  _busMute = new bool[MUTE_OUTS + 1];
         readonly float[] _busGain = NewUnityGains();
+        readonly bool[]  _muteNow = new bool[MUTE_OUTS + 1];   // per-block snapshot of _busMute
         static float[] NewUnityGains()
         {
             var g = new float[MUTE_OUTS + 1];
@@ -334,17 +336,18 @@ namespace PedalDrumGrid
         // ---- Bus mutes (v1.6.0) — appended AFTER every existing global -------
         //  Held switches (stateful: saved with the song, shown in the parameter
         //  window, usable as pattern columns and MIDI-bindable). Each one
-        //  silences its group bus only; out 0 always carries the full kit.
+        //  silences every lane routed to that out, on the bus AND in the out 0
+        //  mix (v1.6.1; v1.6.0 muted the bus only).
         //  Appending globals changes the parameter layout: see README v1.6.0
         //  for what that means for songs saved with 1.5.x.
-        [ParameterDecl(Name = "Mute Out 1", Description = "Mute group bus out 1 (1 = muted). Out 0 is not affected")] public bool MuteOut1 { get => _busMute[1]; set => _busMute[1] = value; }
-        [ParameterDecl(Name = "Mute Out 2", Description = "Mute group bus out 2 (1 = muted). Out 0 is not affected")] public bool MuteOut2 { get => _busMute[2]; set => _busMute[2] = value; }
-        [ParameterDecl(Name = "Mute Out 3", Description = "Mute group bus out 3 (1 = muted). Out 0 is not affected")] public bool MuteOut3 { get => _busMute[3]; set => _busMute[3] = value; }
-        [ParameterDecl(Name = "Mute Out 4", Description = "Mute group bus out 4 (1 = muted). Out 0 is not affected")] public bool MuteOut4 { get => _busMute[4]; set => _busMute[4] = value; }
-        [ParameterDecl(Name = "Mute Out 5", Description = "Mute group bus out 5 (1 = muted). Out 0 is not affected")] public bool MuteOut5 { get => _busMute[5]; set => _busMute[5] = value; }
-        [ParameterDecl(Name = "Mute Out 6", Description = "Mute group bus out 6 (1 = muted). Out 0 is not affected")] public bool MuteOut6 { get => _busMute[6]; set => _busMute[6] = value; }
-        [ParameterDecl(Name = "Mute Out 7", Description = "Mute group bus out 7 (1 = muted). Out 0 is not affected")] public bool MuteOut7 { get => _busMute[7]; set => _busMute[7] = value; }
-        [ParameterDecl(Name = "Mute Out 8", Description = "Mute group bus out 8 (1 = muted). Out 0 is not affected")] public bool MuteOut8 { get => _busMute[8]; set => _busMute[8] = value; }
+        [ParameterDecl(Name = "Mute Out 1", Description = "Mute the lanes routed to out 1 (1 = muted), on the bus and in the out 0 mix")] public bool MuteOut1 { get => _busMute[1]; set => _busMute[1] = value; }
+        [ParameterDecl(Name = "Mute Out 2", Description = "Mute the lanes routed to out 2 (1 = muted), on the bus and in the out 0 mix")] public bool MuteOut2 { get => _busMute[2]; set => _busMute[2] = value; }
+        [ParameterDecl(Name = "Mute Out 3", Description = "Mute the lanes routed to out 3 (1 = muted), on the bus and in the out 0 mix")] public bool MuteOut3 { get => _busMute[3]; set => _busMute[3] = value; }
+        [ParameterDecl(Name = "Mute Out 4", Description = "Mute the lanes routed to out 4 (1 = muted), on the bus and in the out 0 mix")] public bool MuteOut4 { get => _busMute[4]; set => _busMute[4] = value; }
+        [ParameterDecl(Name = "Mute Out 5", Description = "Mute the lanes routed to out 5 (1 = muted), on the bus and in the out 0 mix")] public bool MuteOut5 { get => _busMute[5]; set => _busMute[5] = value; }
+        [ParameterDecl(Name = "Mute Out 6", Description = "Mute the lanes routed to out 6 (1 = muted), on the bus and in the out 0 mix")] public bool MuteOut6 { get => _busMute[6]; set => _busMute[6] = value; }
+        [ParameterDecl(Name = "Mute Out 7", Description = "Mute the lanes routed to out 7 (1 = muted), on the bus and in the out 0 mix")] public bool MuteOut7 { get => _busMute[7]; set => _busMute[7] = value; }
+        [ParameterDecl(Name = "Mute Out 8", Description = "Mute the lanes routed to out 8 (1 = muted), on the bus and in the out 0 mix")] public bool MuteOut8 { get => _busMute[8]; set => _busMute[8] = value; }
 
 
         // Per-lane wave assignment is NOT a parameter — it lives in the GUI
@@ -573,7 +576,7 @@ namespace PedalDrumGrid
             // 1..LANES = group buses. Master Gain scales BOTH (v1.5.3): before, the
             // buses ignored it, so a bus-routed kit was up to 6 dB quieter than the
             // same kit on out 0. We zero the connected output buffers once, then
-            // each active lane adds into master and its bus in a single pass.
+            // each active, unmuted lane adds into master and its bus in a single pass.
             int er = EngineRate();
             float mgScale = (_masterGain / 100f) * OUT_SCALE;
 
@@ -587,6 +590,19 @@ namespace PedalDrumGrid
                 for (int i = 0; i < n; i++) { ob[i].L = 0f; ob[i].R = 0f; }
             }
 
+            // Output mutes (v1.6.1): a muted out silences its lanes EVERYWHERE,
+            // on the group bus and in the out 0 mix, like a mixer channel mute.
+            // So the mute is a per-lane gain taken from the lane's routed out and
+            // applied before the sum. The gain ramps linearly to its target over
+            // ~5 ms. Every lane on one out starts the block from the same stored
+            // gain and uses the same step, so they ramp in lockstep; the stored
+            // gain is advanced once per block after the lanes are mixed. This does
+            // not depend on the bus being connected, because out 0 must follow it.
+            float muteStep = 1f / Math.Max(1f, MUTE_RAMP_SEC * er);
+            // Snapshot the switches once: a setter landing mid-block must not give
+            // the lanes and the stored gain different targets.
+            for (int g = 1; g <= MUTE_OUTS; g++) _muteNow[g] = _busMute[g];
+
             for (int t = 0; t < LANES; t++)
             {
                 var v = _voices[t];
@@ -599,38 +615,43 @@ namespace PedalDrumGrid
                 var bus = (g >= 1 && g < output.Count) ? output[g] : null;
                 if (master == null && bus == null) continue;    // state advanced, nowhere to send
 
-                for (int i = 0; i < n; i++)
-                {
-                    float l = tl[i], r = tr[i];
-                    if (master != null) { master[i].L += l * mgScale;   master[i].R += r * mgScale; }
-                    if (bus    != null) { bus[i].L    += l * mgScale;   bus[i].R    += r * mgScale; }
-                }
-            }
+                bool hasMute = g >= 1 && g <= MUTE_OUTS;
+                float gain   = hasMute ? _busGain[g] : 1f;
+                float target = hasMute && _muteNow[g] ? 0f : 1f;
 
-            // Bus mutes: applied to the summed bus (several lanes can share one),
-            // after the mix, so out 0 is untouched. The gain ramps linearly to
-            // its target over ~5 ms; a bus sitting at unity costs nothing, and an
-            // unconnected bus just snaps so it is already settled when wired up.
-            float muteStep = 1f / Math.Max(1f, MUTE_RAMP_SEC * er);
-            for (int g = 1; g <= MUTE_OUTS; g++)
-            {
-                float target = _busMute[g] ? 0f : 1f;
-                float gain   = _busGain[g];
-                var ob = (g < output.Count) ? output[g] : null;
-                if (ob == null) { _busGain[g] = target; continue; }
                 if (gain == target)
                 {
-                    if (target == 0f)
-                        for (int i = 0; i < n; i++) { ob[i].L = 0f; ob[i].R = 0f; }
-                    continue;                                   // unity: leave as mixed
+                    if (target == 0f) continue;                 // fully muted: voice advanced, no sum
+                    for (int i = 0; i < n; i++)                 // unity: the plain mix
+                    {
+                        float l = tl[i] * mgScale, r = tr[i] * mgScale;
+                        if (master != null) { master[i].L += l; master[i].R += r; }
+                        if (bus    != null) { bus[i].L    += l; bus[i].R    += r; }
+                    }
+                    continue;
                 }
-                for (int i = 0; i < n; i++)
+
+                for (int i = 0; i < n; i++)                     // mid-ramp
                 {
                     if (gain < target)      gain = Math.Min(target, gain + muteStep);
                     else if (gain > target) gain = Math.Max(target, gain - muteStep);
-                    ob[i].L *= gain; ob[i].R *= gain;
+                    float k = gain * mgScale;
+                    float l = tl[i] * k, r = tr[i] * k;
+                    if (master != null) { master[i].L += l; master[i].R += r; }
+                    if (bus    != null) { bus[i].L    += l; bus[i].R    += r; }
                 }
-                _busGain[g] = gain;
+            }
+
+            // Advance each out's stored gain by this block (same arithmetic as the
+            // per-lane ramp above, so the next block starts where the lanes ended).
+            for (int g = 1; g <= MUTE_OUTS; g++)
+            {
+                float target = _muteNow[g] ? 0f : 1f;
+                float gain   = _busGain[g];
+                if (gain == target) continue;
+                float span = muteStep * n;
+                _busGain[g] = gain < target ? Math.Min(target, gain + span)
+                                            : Math.Max(target, gain - span);
             }
             return true;
         }
