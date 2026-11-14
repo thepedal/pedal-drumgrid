@@ -7,7 +7,7 @@ per-lane Velocity, per-lane Humanize Vel, and two tracker-style **Command/Argume
 effect columns (v1.1). Samples come from the ReBuzz wavetable (assigned per lane in the
 GUI) or from a self-contained `.pdrumgrid.xml` kit with embedded audio.
 
-Status: **v1.5.4** (Master Gain range raised to 254, About command, see below) — **v1.5.3** (Master Gain now also scales the group buses, see below) — **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
+Status: **v1.6.0** (per-output mutes for outs 1..8; **parameter layout change**, see below) — **v1.5.4** (Master Gain range raised to 254, About command, see below) — **v1.5.3** (Master Gain now also scales the group buses, see below) — **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
 several lanes onto one bus), grid-aware swing (`Swing Unit` 1/8 or 1/16),
 master `Humanize` (late-only timing on every hit) and **per-track `Humanize Vel`**
 (quieter-only velocity scatter on chosen lanes), kit load/save with embedded
@@ -26,7 +26,7 @@ deferred-trigger fade-cross (Tracker §4.2, §10).
 | Decision | Rationale (notes ref) |
 |---|---|
 | Trigger grid = **16 global switches** (`Trig 1..16`), one per lane | Track params are laid out track-major, so a track-param trigger interleaves with the per-track columns and can't form one adjacent block. As distinct globals the triggers sit together at the far left (Core §9 `bool`→Switch; §25 `IsStateless` = pattern-only) and **can't collide** in `parametersChanged`. Velocity + the Command/Argument columns stay track params → grouped per-track on the right. |
-| Column order: `[Trig 1..16][Swing  Swing Unit  Swing Phase  Humanize  Master Gain][per-track: Velocity  Humanize Vel  Command 1  Argument 1  Command 2  Argument 2]` | Globals render before the track section (Roster song-authoring facts). Triggers declared first → leftmost; wave assignment and output routing are GUI-only (not columns). The machine **auto-initialises to 16 pattern tracks** (UI-thread, one-shot, bump-up-only) so all per-lane columns are present out of the box — no manual "add track" step. |
+| Column order: `[Trig 1..16][Swing  Swing Unit  Swing Phase  Humanize  Master Gain][Mute Out 1..8][per-track: Velocity  Humanize Vel  Command 1  Argument 1  Command 2  Argument 2]` | Globals render before the track section (Roster song-authoring facts). Triggers declared first → leftmost; wave assignment and output routing are GUI-only (not columns). The machine **auto-initialises to 16 pattern tracks** (UI-thread, one-shot, bump-up-only) so all per-lane columns are present out of the box — no manual "add track" step. |
 | **Multi-out** via the `IList<Sample[]>` Work overload | Defining that overload sets `MULTI_IO` automatically (Tracker §12.1). Out 0 = full mix; outs 1..N = **group buses**; Master Gain scales all of them (v1.5.3) (Tracker §12.3). Each lane sums into one bus (default lane *i* → out *i*+1) and several lanes can share a bus (e.g. all hats → out 3). Routing is GUI-set and saved in both the kit and `MachineState`. `Work` renders/mixes only **active** lanes — idle lanes are skipped entirely. |
 | `OutputCount = LANES + 1` declared up front (static headroom) | Auto-syncing `OutputCount` to track count crashes on song reload when a saved connection references a channel ≥ current count (Tracker §12.2). Unconnected slots are `null` and cost nothing. |
 | **Velocity + Commands read from the firing lane's pvalue at trigger time** | The trigger is a global param consumed in `Work`; the track setters can land too late to affect the same-row hit (pattern cells looked like they did nothing). Fix: in `SetTrig`, read the firing lane's **own** Velocity and Command/Argument pvalues (Tracker §16.3) — the sequencer fills all row pvalues before any setter runs. Velocity is **held** (kept on `NoValue`); commands are **momentary** (None when `NoValue`). `Humanize Vel` is a second **held** track param read the same way, so velocity scatter can be set on individual lanes (just a snare, one hat) rather than globally. Guards: only while `Buzz.Playing`, and only for `lane < TrackCount` (beyond the real track count the `int[256]` slot is still `0`, not `NoValue`, and would clobber the held velocity to 0 → silent lane). Same-row multi-lane hits each read their own pvalue, so Core §14 collisions don't matter. |
@@ -41,8 +41,9 @@ deferred-trigger fade-cross (Tracker §4.2, §10).
 - **Per-step columns.** 16 global `Trig` switches + per-lane `Velocity`
   (byte 0–127), `Humanize Vel`, and two `Command`/`Argument` effect columns
   (v1.1, see below). Per-row pitch is now command `05` (the dedicated Pitch
-  column was removed). v1.5 is the intended last release with breaking parameter
-  changes; the layout is stable from here (Build §3.3).
+  column was removed). v1.5 was meant to be the last release with breaking parameter
+  changes; v1.6.0 appends eight `Mute Out` globals (existing parameters keep
+  their names and order; see Output mutes below).
 - **Voicing per lane.** Scaffold = 1 voice/lane with deferred re-trigger
   fade-cross + choke groups (the drum-machine model). A small voice pool per
   lane (for overlapping tom tails) is a later option.
@@ -210,6 +211,35 @@ deploy is easy to spot. The version lives in one constant,
 **Compatibility.** Same parameters in the same order; only one maximum changed.
 No `MachineState` or kit-format change. A song saved with Master Gain above 200
 will be out of range for v1.5.3 and earlier.
+
+---
+
+## Output mutes (v1.6.0)
+
+Eight new global switches, **Mute Out 1 .. Mute Out 8**, one per group bus on
+outs 1..8. They are ordinary held parameters: saved with the song, shown in the
+parameter window, usable as pattern columns (1 = mute, 0 = unmute) and
+MIDI-bindable. Outs 9..16 have no mute.
+
+- A mute silences **the bus only**. Out 0 still carries the full kit.
+- The mute acts on the summed bus, so every lane routed to that out is muted
+  together. Voices keep playing underneath, so unmuting mid-sample lets the tail
+  through.
+- The gain ramps over about 5 ms each way, so toggling never clicks.
+
+Column order is now `[Trig 1..16][Swing  Swing Unit  Swing Phase  Humanize
+Master Gain][Mute Out 1..8][per-track ...]`.
+
+**Compatibility: this changes the parameter layout.** The mutes are appended
+after Master Gain, so there are 29 globals instead of 21. Values and patterns
+load by name on a ReBuzz with the load-by-name fixes (ReBuzz PRs #224 and #230).
+The Modern Pattern Editor stores track columns by a flat index that depends on
+the global count, so on a ReBuzz **without** the saved-parameter-layout fix for
+the editor, a 1.5.x song's per-track columns land on the wrong parameters or
+fail to load. Open old songs on a patched ReBuzz, check the track columns, then
+save. Do not save a song that loaded with shifted columns: the shift becomes
+permanent. No `MachineState` or kit-format change. Songs saved with 1.6.0 do not
+load in 1.5.x.
 
 ---
 
