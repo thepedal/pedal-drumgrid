@@ -7,7 +7,7 @@ per-lane Velocity, per-lane Humanize Vel, and two tracker-style **Command/Argume
 effect columns (v1.1). Samples come from the ReBuzz wavetable (assigned per lane in the
 GUI) or from a self-contained `.pdrumgrid.xml` kit with embedded audio.
 
-Status: **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
+Status: **v1.5.3** (Master Gain now also scales the group buses, see below) — **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
 several lanes onto one bus), grid-aware swing (`Swing Unit` 1/8 or 1/16),
 master `Humanize` (late-only timing on every hit) and **per-track `Humanize Vel`**
 (quieter-only velocity scatter on chosen lanes), kit load/save with embedded
@@ -27,7 +27,7 @@ deferred-trigger fade-cross (Tracker §4.2, §10).
 |---|---|
 | Trigger grid = **16 global switches** (`Trig 1..16`), one per lane | Track params are laid out track-major, so a track-param trigger interleaves with the per-track columns and can't form one adjacent block. As distinct globals the triggers sit together at the far left (Core §9 `bool`→Switch; §25 `IsStateless` = pattern-only) and **can't collide** in `parametersChanged`. Velocity + the Command/Argument columns stay track params → grouped per-track on the right. |
 | Column order: `[Trig 1..16][Swing  Swing Unit  Swing Phase  Humanize  Master Gain][per-track: Velocity  Humanize Vel  Command 1  Argument 1  Command 2  Argument 2]` | Globals render before the track section (Roster song-authoring facts). Triggers declared first → leftmost; wave assignment and output routing are GUI-only (not columns). The machine **auto-initialises to 16 pattern tracks** (UI-thread, one-shot, bump-up-only) so all per-lane columns are present out of the box — no manual "add track" step. |
-| **Multi-out** via the `IList<Sample[]>` Work overload | Defining that overload sets `MULTI_IO` automatically (Tracker §12.1). Out 0 = full mix (×Master Gain); outs 1..N = dry **group buses** (Tracker §12.3). Each lane sums into one bus (default lane *i* → out *i*+1) and several lanes can share a bus (e.g. all hats → out 3). Routing is GUI-set and saved in both the kit and `MachineState`. `Work` renders/mixes only **active** lanes — idle lanes are skipped entirely. |
+| **Multi-out** via the `IList<Sample[]>` Work overload | Defining that overload sets `MULTI_IO` automatically (Tracker §12.1). Out 0 = full mix; outs 1..N = **group buses**; Master Gain scales all of them (v1.5.3) (Tracker §12.3). Each lane sums into one bus (default lane *i* → out *i*+1) and several lanes can share a bus (e.g. all hats → out 3). Routing is GUI-set and saved in both the kit and `MachineState`. `Work` renders/mixes only **active** lanes — idle lanes are skipped entirely. |
 | `OutputCount = LANES + 1` declared up front (static headroom) | Auto-syncing `OutputCount` to track count crashes on song reload when a saved connection references a channel ≥ current count (Tracker §12.2). Unconnected slots are `null` and cost nothing. |
 | **Velocity + Commands read from the firing lane's pvalue at trigger time** | The trigger is a global param consumed in `Work`; the track setters can land too late to affect the same-row hit (pattern cells looked like they did nothing). Fix: in `SetTrig`, read the firing lane's **own** Velocity and Command/Argument pvalues (Tracker §16.3) — the sequencer fills all row pvalues before any setter runs. Velocity is **held** (kept on `NoValue`); commands are **momentary** (None when `NoValue`). `Humanize Vel` is a second **held** track param read the same way, so velocity scatter can be set on individual lanes (just a snare, one hat) rather than globally. Guards: only while `Buzz.Playing`, and only for `lane < TrackCount` (beyond the real track count the `int[256]` slot is still `0`, not `NoValue`, and would clobber the held velocity to 0 → silent lane). Same-row multi-lane hits each read their own pvalue, so Core §14 collisions don't matter. |
 | Per-lane **wave assignment is GUI-only**, persisted in `MachineState` | Kept off the pattern grid so the trigger block butts against the per-track section. The GUI's 16 per-lane pickers point each lane at a wavetable slot; the kit is the single source of truth and its full per-lane state (wavetable slot or file path) is serialised in `MachineState` (Core §39), since non-parameter state isn't auto-persisted. |
@@ -175,6 +175,23 @@ kits from any earlier version load unchanged. When setters arrive on the row edg
 the behaviour is identical to before. While stopped, pending hits are still held
 until the transport moves, as before. The only audible change: drums in existing
 songs play one tick earlier, which is where they were written.
+
+---
+
+## Master Gain on the group buses (v1.5.3)
+
+Master Gain used to scale only out 0. Outs 1..16 were fixed at unity, so a kit
+played through its group buses ignored the parameter: at Master Gain 200 the
+buses were 6 dB below out 0. Songs converted from SampleGrid by `sg2dg.py` were
+hit hardest, because the converter normalises every lane's Velocity to the
+loudest lane and puts the common factor in Master Gain.
+
+v1.5.3 applies Master Gain to out 0 and to every bus.
+
+**Compatibility.** No parameter, `MachineState` or kit-format change. Out 0 is
+unchanged. Bus levels change only where Master Gain is not 100: they move by
+the Master Gain amount (+6 dB at 200), so trim downstream gains or compressor
+thresholds that were set against the old bus level.
 
 ---
 

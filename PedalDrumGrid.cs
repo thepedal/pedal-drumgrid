@@ -273,7 +273,7 @@ namespace PedalDrumGrid
         public int Humanize { get => _humanize; set => _humanize = value; }
 
         [ParameterDecl(Name = "Master Gain", MinValue = 0, MaxValue = 200, DefValue = 100,
-            Description = "Master mix gain on out 0 (100 = unity)")]
+            Description = "Gain on the mix (out 0) and all group buses (100 = unity, 200 = +6 dB)")]
         public int MasterGain { get => _masterGain; set => _masterGain = value; }
 
 
@@ -499,10 +499,11 @@ namespace PedalDrumGrid
 
             // Render and mix only the lanes that actually have something to play.
             // Idle lanes are skipped entirely — no render, no clear, no sum — which
-            // is the main saving when the kit is sparse. Out 0 = full mix (×master
-            // gain); outs 1..LANES = dry group buses. We zero the connected output
-            // buffers once, then each active lane adds into master and its bus in a
-            // single pass.
+            // is the main saving when the kit is sparse. Out 0 = full mix; outs
+            // 1..LANES = group buses. Master Gain scales BOTH (v1.5.3): before, the
+            // buses ignored it, so a bus-routed kit was up to 6 dB quieter than the
+            // same kit on out 0. We zero the connected output buffers once, then
+            // each active lane adds into master and its bus in a single pass.
             int er = EngineRate();
             float mgScale = (_masterGain / 100f) * OUT_SCALE;
 
@@ -532,7 +533,7 @@ namespace PedalDrumGrid
                 {
                     float l = tl[i], r = tr[i];
                     if (master != null) { master[i].L += l * mgScale;   master[i].R += r * mgScale; }
-                    if (bus    != null) { bus[i].L    += l * OUT_SCALE;  bus[i].R    += r * OUT_SCALE; }
+                    if (bus    != null) { bus[i].L    += l * mgScale;   bus[i].R    += r * mgScale; }
                 }
             }
             return true;
