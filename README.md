@@ -7,7 +7,7 @@ per-lane Velocity, per-lane Humanize Vel, and two tracker-style **Command/Argume
 effect columns (v1.1). Samples come from the ReBuzz wavetable (assigned per lane in the
 GUI) or from a self-contained `.pdrumgrid.xml` kit with embedded audio.
 
-Status: **v1.7.0** (optional kit-file link: the song stores the kit path instead of the audio, see below) — **v1.6.1** (a muted out is now also silent in the out 0 mix) — **v1.6.0** (per-output mutes for outs 1..8; **parameter layout change**, see below) — **v1.5.4** (Master Gain range raised to 254, About command, see below) — **v1.5.3** (Master Gain now also scales the group buses, see below) — **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
+Status: **v1.8.0** (samples shared by several DrumGrids are saved once per song, see below) — **v1.7.0** (optional kit-file link: the song stores the kit path instead of the audio, see below) — **v1.6.1** (a muted out is now also silent in the out 0 mix) — **v1.6.0** (per-output mutes for outs 1..8; **parameter layout change**, see below) — **v1.5.4** (Master Gain range raised to 254, About command, see below) — **v1.5.3** (Master Gain now also scales the group buses, see below) — **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
 several lanes onto one bus), grid-aware swing (`Swing Unit` 1/8 or 1/16),
 master `Humanize` (late-only timing on every hit) and **per-track `Humanize Vel`**
 (quieter-only velocity scatter on chosen lanes), kit load/save with embedded
@@ -32,7 +32,7 @@ deferred-trigger fade-cross (Tracker §4.2, §10).
 | **Velocity + Commands read from the firing lane's pvalue at trigger time** | The trigger is a global param consumed in `Work`; the track setters can land too late to affect the same-row hit (pattern cells looked like they did nothing). Fix: in `SetTrig`, read the firing lane's **own** Velocity and Command/Argument pvalues (Tracker §16.3) — the sequencer fills all row pvalues before any setter runs. Velocity is **held** (kept on `NoValue`); commands are **momentary** (None when `NoValue`). `Humanize Vel` is a second **held** track param read the same way, so velocity scatter can be set on individual lanes (just a snare, one hat) rather than globally. Guards: only while `Buzz.Playing`, and only for `lane < TrackCount` (beyond the real track count the `int[256]` slot is still `0`, not `NoValue`, and would clobber the held velocity to 0 → silent lane). Same-row multi-lane hits each read their own pvalue, so Core §14 collisions don't matter. |
 | Per-lane **wave assignment is GUI-only**, persisted in `MachineState` | Kept off the pattern grid so the trigger block butts against the per-track section. The GUI's 16 per-lane pickers point each lane at a wavetable slot; the kit is the single source of truth and its full per-lane state (wavetable slot or file path) is serialised in `MachineState` (Core §39), since non-parameter state isn't auto-persisted. |
 | **Swing** = per-step trigger *delay*, not a step clock | DrumGrid doesn't own a step clock — triggers arrive from pattern rows. So swing delays off-beat steps using sub-tick scheduling (Tracker §7.7 note-delay machinery), reusing Chord's ratio math (Chord §3, §11) recast as a delay. See "Swing" below. |
-| Non-parameter state framed in `byte[]` `MachineState` (v7) | Magic+version+length-prefixed framing (Core §39.1). Holds the kit reference, full per-lane source state (embedded audio + names) and per-lane **output routing**. Swing / Humanize / Master Gain are ordinary ReBuzz-persisted *parameters* (not in `MachineState`); wave assignment and routing aren't parameters, so they live here. v7 (1.7.0) adds a flags byte and an optional *linked* form that stores the kit path, file length and SHA-256 instead of the lane audio (see *Kit-file link*). The reader version-tolerates v1..v7 (missing fields default). |
+| Non-parameter state framed in `byte[]` `MachineState` (v8) | Magic+version+length-prefixed framing (Core §39.1). Holds the kit reference, full per-lane source state (embedded audio + names) and per-lane **output routing**. Swing / Humanize / Master Gain are ordinary ReBuzz-persisted *parameters* (not in `MachineState`); wave assignment and routing aren't parameters, so they live here. v7 (1.7.0) adds a flags byte and an optional *linked* form that stores the kit path, file length and SHA-256 instead of the lane audio (see *Kit-file link*). v8 (1.8.0) lets an embedded lane be saved as a hash when another DrumGrid in the song saves that sample (see *Shared samples*). The reader version-tolerates v1..v8 (missing fields default). |
 | GUI base class = `FrameworkElement` (if custom-painted) | `UserControl`'s template silently overpaints `OnRender` (Core §26.7). The kit/swing panel is control-composed, so it can stay `UserControl`; the optional lane meters/grid preview must be `FrameworkElement`. |
 
 ### Open choices you may want to change
@@ -280,6 +280,40 @@ off). A song saved with 1.7.0 does not load its kit in older versions (they
 reject state version 7 and start with an empty kit). No parameter or kit-format
 change.
 
+## Shared samples (v1.8.0)
+
+When several DrumGrids in a song use the same sample (an A/B pair on one kit, or
+two kits that share most of their lanes), 1.8.0 saves the audio once. Samples are
+matched per lane by the SHA-256 of their WAV bytes, so partial overlaps count too.
+In `amanita_aliena_26` the eight DrumGrids have 128 lanes but only 48 distinct
+samples: about 19 MB in the song instead of 55.6 MB.
+
+- **Who saves what.** At save time every DrumGrid looks at the DrumGrids in the
+  song. For each sample, one of the machines that has it saves the audio: the first
+  by machine name, or the first by name among those with *Store own copy of
+  samples* ticked. The others save the sample's hash. A sample only one DrumGrid
+  uses is always saved in full, so a song with one DrumGrid saves as before.
+  Machines saving a kit-file link (v1.7.0) save no audio, so they are never chosen.
+- **Loading.** Every DrumGrid publishes the samples it holds to a store shared by
+  all DrumGrids in the session; a lane that has only a hash takes its audio from
+  there. Load order doesn't matter: a lane waits until the machine holding its
+  sample has loaded.
+- **In memory every lane has its audio.** Sharing only affects what is written
+  to the song file. Deleting or renaming a DrumGrid just changes who saves a
+  sample at the next save.
+- **Taking a machine out of the song.** A DrumGrid saved with hash-only lanes
+  needs the holder machine. Copied into another song or saved as a template on
+  its own, it works in the same ReBuzz session (the shared store still has the
+  samples) but not in a new one. Tick **Store own copy of samples** first to make
+  it self-contained. A lane whose sample can't be found shows a warning in the
+  GUI and stays silent.
+- The status line under the kit buttons says how many lanes are saved by another
+  DrumGrid, and warns about missing shared samples.
+
+**Compatibility.** Songs saved by any earlier version load unchanged. A song
+saved by 1.8.0 can't be read by DrumGrid 1.7.0 or earlier. No parameter or
+kit-format change.
+
 ## Humanize (timing + velocity)
 
 Two independent, non-cumulative randomisers, both recomputed fresh per hit so
@@ -349,6 +383,7 @@ Delay (`01`) and Retrigger (`02`) stay trigger-row-only.
 | File | Contents |
 |---|---|
 | `PedalDrumGrid.csproj` | Fully compliant with Build §1.2 (net10, UseWPF, no pdb/deps, NoWarn) + deploy to `Gear\Generators` (Build §1.3). |
+| `SharedSamples.cs` | Process-wide, content-addressed store of embedded lane audio (weak references) and the queue of kits waiting for a shared sample (v1.8.0). |
 | `PedalDrumGrid.cs` | Machine: params (trigger grid + globals + per-track Velocity/Humanize Vel/Command/Argument), setters with collision recovery, per-row command capture + translation, multi-out `Work` with per-lane routing and active-lane-only mixing, swing-as-delay, timing humanize, transport stop, `MachineState`, GUI factory. |
 | `Voice.cs` | Per-lane sample voice: linear-interp playback, velocity gain, deferred re-trigger fade, choke, start offset, reverse, scheduled cut, sample-accurate retrigger with live per-row modulation (`SetRetrigPitch`/`SetRetrigOffset`/`SetRetrigCut`). Stops rendering once faded out so choked/cut tails don't read silently. |
 | `DrumKit.cs` | `.pdrumgrid.xml` load/save (incl. per-lane velocity/pitch/choke/output routing), wavetable snapshot via `GetDataAsFloat`, lane source resolution. |

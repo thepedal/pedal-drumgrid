@@ -28,7 +28,21 @@ namespace PedalDrumGrid
         public string Name;          // display name (sample/lane label)
         public int    WaveIndex;     // for Wavetable
         public string FilePath;      // for File (already resolved to absolute)
-        public byte[] EmbeddedWav;   // for Embedded (raw 16-bit PCM WAV bytes)
+        public byte[] EmbeddedWav;   // for Embedded (WAV bytes); null while waiting for a shared sample
+        public byte[] PendingHash;   // v1.8.0: SHA-256 of a shared sample not yet resolved (EmbeddedWav null)
+        byte[] _hashOf, _hash;       // SHA-256 cache, valid while EmbeddedWav is the same array
+
+        // SHA-256 of this lane's embedded audio (or of the shared sample it waits for).
+        public byte[] Sha256()
+        {
+            if (EmbeddedWav == null) return PendingHash;
+            if (!ReferenceEquals(_hashOf, EmbeddedWav))
+            {
+                _hash = SharedSamples.Hash(EmbeddedWav);
+                _hashOf = EmbeddedWav;
+            }
+            return _hash;
+        }
         public int    RootNote = 60;
         public int    ChokeGroup;
         public int    Velocity = 127; // per-lane default (0..127)
@@ -81,7 +95,11 @@ namespace PedalDrumGrid
             {
                 case LaneSourceKind.Wavetable: detail = "WT " + ls.WaveIndex; break;
                 case LaneSourceKind.File:      detail = "file: " + System.IO.Path.GetFileName(ls.FilePath ?? ""); break;
-                case LaneSourceKind.Embedded:  detail = "embedded " + (ls.EmbeddedWav?.Length ?? 0) / 1024 + " KB"; break;
+                case LaneSourceKind.Embedded:
+                    detail = ls.EmbeddedWav != null
+                        ? "embedded " + ls.EmbeddedWav.Length / 1024 + " KB"
+                        : "\u26A0 shared sample missing (its holder DrumGrid is not in the song)";
+                    break;
                 default: return "(empty)";
             }
             return string.IsNullOrEmpty(ls.Name) ? detail : ls.Name + " — " + detail;
@@ -129,14 +147,33 @@ namespace PedalDrumGrid
         }
 
         // ---- Lane-state persistence (MachineState v3 writes names) ---------
-        public void WriteLanes(System.IO.BinaryWriter bw)
+        // On-disk lane kind for a shared embedded sample (state v8+). In memory
+        // such a lane is Kind = Embedded with its bytes from SharedSamples.
+        public const byte WIRE_EMBEDDED_REF = 4;
+
+        // storeFull(hash) decides, per embedded lane, whether this machine writes
+        // the audio (true) or only its hash (false). null = always write audio.
+        public void WriteLanes(System.IO.BinaryWriter bw, Func<byte[], bool> storeFull = null)
         {
             bw.Write((byte)_lanes.Length);
             foreach (var ls in _lanes)
             {
-                bw.Write((byte)ls.Kind);
+                bool asRef = false;
+                if (ls.Kind == LaneSourceKind.Embedded)
+                {
+                    var h = ls.Sha256();
+                    if (ls.EmbeddedWav == null) asRef = h != null;           // unresolved: keep the reference
+                    else if (storeFull != null && h != null) asRef = !storeFull(h);
+                }
+                bw.Write(asRef ? WIRE_EMBEDDED_REF : (byte)ls.Kind);
                 WriteStr(bw, ls.Name);                // v3+: per-lane name
                 bw.Write(ls.ChokeGroup);
+                if (asRef)
+                {
+                    bw.Write(ls.RootNote);
+                    bw.Write(ls.Sha256());                // 32 bytes
+                    continue;
+                }
                 switch (ls.Kind)
                 {
                     case LaneSourceKind.Wavetable:
@@ -175,13 +212,20 @@ namespace PedalDrumGrid
             int n = br.ReadByte();
             for (int i = 0; i < n; i++)
             {
-                var kind = (LaneSourceKind)br.ReadByte();
+                byte wire = br.ReadByte();
+                var kind = (LaneSourceKind)wire;
                 string name = withNames ? ReadStr(br) : null;
                 int choke = br.ReadInt32();
                 int waveIndex = 0, rootNote = 60;
                 string path = null;
-                byte[] wav = null;
-                if (kind == LaneSourceKind.Wavetable)
+                byte[] wav = null, pending = null;
+                if (wire == WIRE_EMBEDDED_REF)
+                {
+                    kind = LaneSourceKind.Embedded;
+                    rootNote = br.ReadInt32();
+                    pending = br.ReadBytes(32);
+                }
+                else if (kind == LaneSourceKind.Wavetable)
                 {
                     waveIndex = br.ReadInt32();
                 }
@@ -202,6 +246,7 @@ namespace PedalDrumGrid
                 ls.ChokeGroup = choke;
                 ls.WaveIndex = waveIndex; ls.RootNote = rootNote;
                 ls.FilePath = path; ls.EmbeddedWav = wav;
+                ls.PendingHash = pending;
                 ls.Snapshot = null;     // rebuild lazily
             }
             _rev++;
@@ -259,14 +304,65 @@ namespace PedalDrumGrid
 
         // Build snapshots for every lane up front (call on the UI thread after
         // load) so the first hit doesn't decode/allocate on the audio thread.
+        // Also publishes this kit's embedded samples to SharedSamples and takes
+        // any shared samples its lanes are waiting for (v1.8.0).
         public void PrebuildAll()
         {
+            ResolvePending();
             for (int i = 0; i < _lanes.Length; i++)
             {
                 var ls = _lanes[i];
                 if (ls.Kind != LaneSourceKind.None && ls.Snapshot == null)
                     ls.Snapshot = Build(ls);
             }
+            var items = new System.Collections.Generic.List<(byte[], byte[])>();
+            foreach (var ls in _lanes)
+                if (ls.Kind == LaneSourceKind.Embedded && ls.EmbeddedWav != null)
+                    items.Add((ls.Sha256(), ls.EmbeddedWav));
+            if (items.Count > 0) SharedSamples.Publish(items);
+        }
+
+        // Fill lanes waiting for a shared sample from SharedSamples. Returns true
+        // when no lane is left waiting; otherwise registers to be woken later.
+        // Called on load paths (UI/load thread), never from Work().
+        public bool ResolvePending()
+        {
+            bool waiting = false;
+            foreach (var ls in _lanes)
+            {
+                if (ls.Kind != LaneSourceKind.Embedded || ls.EmbeddedWav != null || ls.PendingHash == null)
+                    continue;
+                var wav = SharedSamples.TryGet(ls.PendingHash);
+                if (wav == null) { waiting = true; continue; }
+                ls.EmbeddedWav = wav;
+                ls.PendingHash = null;
+                ls.Snapshot = Build(ls);           // decode here, off the audio thread
+                _rev++;                            // lane changed: kit-file match must be re-checked
+            }
+            if (waiting) SharedSamples.Wait(this);
+            return !waiting;
+        }
+
+        // Hashes of the embedded samples this kit actually holds (bytes present).
+        public System.Collections.Generic.HashSet<string> HeldSampleKeys()
+        {
+            var set = new System.Collections.Generic.HashSet<string>();
+            foreach (var ls in _lanes)
+                if (ls.Kind == LaneSourceKind.Embedded && ls.EmbeddedWav != null)
+                    set.Add(SharedSamples.Key(ls.Sha256()));
+            return set;
+        }
+
+        public byte[] LaneSha256(int lane) => (uint)lane < _lanes.Length ? _lanes[lane].Sha256() : null;
+        public bool LaneHasAudio(int lane) => (uint)lane < _lanes.Length && _lanes[lane].EmbeddedWav != null;
+
+        // Lanes still waiting for a shared sample.
+        public int MissingSharedCount()
+        {
+            int n = 0;
+            foreach (var ls in _lanes)
+                if (ls.Kind == LaneSourceKind.Embedded && ls.EmbeddedWav == null && ls.PendingHash != null) n++;
+            return n;
         }
 
         WaveSnapshot Build(LaneSource ls)

@@ -25,7 +25,7 @@ namespace PedalDrumGrid
     public class PedalDrumGridMachine : IBuzzMachine
     {
         // Single source of truth for the version (AboutWindow §1.3). Bump here.
-        internal const string Version = "1.7.0";
+        internal const string Version = "1.8.0";
 
         public const int LANES        = 16;
         public const int MUTE_OUTS    = 8;               // Mute Out 1..8 (outs 1..8 only)
@@ -841,15 +841,25 @@ namespace PedalDrumGrid
         // Linked is written only when Link Kit File is on AND the live lanes are
         // exactly what the kit file holds (DrumKit.MatchesKitFile); otherwise the
         // full form is written, so a linked song never silently loses an edit.
+        // v8 (1.8.0): same layout as v7. Flags bit1 = Store Own Copy. In the full
+        // form an embedded lane may be written as WIRE_EMBEDDED_REF (root note +
+        // SHA-256, no audio) when another DrumGrid in the song holds that sample
+        // (see SHARED SAMPLES below). Readers before 1.8.0 can't read v8; 1.8.0 reads all.
         // v6 and earlier: MAGIC, VERSION, kitPath, lanes, routing (v4+), and v5's
-        // trailing humanize byte, which is ignored. Reader accepts v1..v7.
+        // trailing humanize byte, which is ignored. Reader accepts v1..v8.
         const uint MAGIC = 0x44475250u;   // "PRGD"
-        const byte VERSION = 7;
+        const byte VERSION = 8;
         const byte FLAG_LINK = 1;
+        const byte FLAG_OWN_COPY = 2;
         const byte FORM_FULL = 0, FORM_LINKED = 1;
 
         // Store the kit file's path in the song instead of the audio (GUI checkbox).
         public bool LinkKitFile { get; set; }
+
+        // v1.8.0: always write this machine's own embedded audio, even for samples
+        // another DrumGrid in the song also uses (GUI checkbox). Makes the machine
+        // self-contained, e.g. before copying it to another song on its own.
+        public bool StoreOwnCopy { get; set; }
 
         // Set at load when a linked kit file is missing or has changed since the
         // song was saved; shown by the GUI. Cleared by a successful Load Kit.
@@ -881,7 +891,7 @@ namespace PedalDrumGrid
                     var pb = System.Text.Encoding.UTF8.GetBytes(kitPath);
                     bw.Write((ushort)pb.Length);
                     bw.Write(pb);
-                    bw.Write(LinkKitFile ? FLAG_LINK : (byte)0);
+                    bw.Write((byte)((LinkKitFile ? FLAG_LINK : 0) | (StoreOwnCopy ? FLAG_OWN_COPY : 0)));
 
                     byte[] hash = null;
                     bool linked = LinkKitFile && _kit.MatchesKitFile(out hash) && hash != null;
@@ -908,7 +918,8 @@ namespace PedalDrumGrid
                     else
                     {
                         bw.Write(FORM_FULL);
-                        _kit.WriteLanes(bw);            // full per-lane source state
+                        var plan = BuildSharingPlan();
+                        _kit.WriteLanes(bw, plan == null ? null : h => plan.StoresHere(h));
                     }
                     for (int t = 0; t < LANES; t++) bw.Write((byte)_laneOut[t]);   // v4+ routing
                     return ms.ToArray();
@@ -935,6 +946,7 @@ namespace PedalDrumGrid
                     {
                         byte flags = br.ReadByte();
                         LinkKitFile = (flags & FLAG_LINK) != 0;
+                        StoreOwnCopy = (flags & FLAG_OWN_COPY) != 0;
                         byte form = br.ReadByte();
                         if (form == FORM_LINKED)
                             ReadLinked(br, kitPath);
@@ -944,6 +956,7 @@ namespace PedalDrumGrid
                     else
                     {
                         LinkKitFile = false;
+                        StoreOwnCopy = false;
                         if (v >= 2)
                             _kit.ReadLanes(br, withNames: v >= 3);   // self-contained lane state
                         else if (!string.IsNullOrEmpty(kitPath))
@@ -957,6 +970,80 @@ namespace PedalDrumGrid
                 }
                 catch { /* corrupt — start fresh */ }
             }
+        }
+
+        // =================================================================
+        //  SHARED SAMPLES (v1.8.0): each distinct embedded sample saved once
+        // =================================================================
+        // Rule, evaluated by every DrumGrid from the live song at save time so all
+        // of them agree: the candidates for a sample are the DrumGrids that hold
+        // its bytes and will write their lanes in full (not linked to a kit file).
+        // If any candidate has Store Own Copy on, the holder is the first of those
+        // by name (ordinal); otherwise the first candidate by name. The holder and
+        // every Store Own Copy machine write the audio; the rest write the hash.
+        // A sample used by one DrumGrid only is therefore always stored in full.
+        sealed class SharingPlan
+        {
+            public readonly System.Collections.Generic.Dictionary<string, string> Holder = new();
+            public string Self;
+            public bool OwnCopy;
+            public bool StoresHere(byte[] hash)
+            {
+                if (OwnCopy) return true;
+                return !Holder.TryGetValue(SharedSamples.Key(hash), out var h) || h == Self;
+            }
+        }
+
+        // null = can't see the song: write everything in full (always safe).
+        SharingPlan BuildSharingPlan()
+        {
+            try
+            {
+                var self = host?.Machine;
+                var song = Buzz?.Song;
+                if (self == null || song?.Machines == null) return null;
+                var plan = new SharingPlan { Self = self.Name, OwnCopy = StoreOwnCopy };
+                if (StoreOwnCopy) return plan;
+
+                var best = new System.Collections.Generic.Dictionary<string, (string name, bool own)>();
+                bool sawSelf = false;
+                foreach (var m in song.Machines)
+                {
+                    if (m?.ManagedMachine is not PedalDrumGridMachine dg) continue;
+                    if (ReferenceEquals(dg, this)) sawSelf = true;
+                    if (dg.WillSaveLinked) continue;          // writes no lane audio
+                    string name = m.Name ?? "";
+                    bool own = dg.StoreOwnCopy;
+                    foreach (var key in dg.Kit.HeldSampleKeys())
+                    {
+                        if (!best.TryGetValue(key, out var cur) ||
+                            (own && !cur.own) ||
+                            (own == cur.own && string.CompareOrdinal(name, cur.name) < 0))
+                            best[key] = (name, own);
+                    }
+                }
+                if (!sawSelf) return null;                    // not in the song (e.g. being cloned): full
+                foreach (var kv in best) plan.Holder[kv.Key] = kv.Value.name;
+                return plan;
+            }
+            catch { return null; }
+        }
+
+        // GUI summary: (lanes this machine writes as hash only, lanes still missing).
+        public (int sharedElsewhere, int missing) SharingSummary()
+        {
+            int missing = _kit.MissingSharedCount();
+            if (WillSaveLinked) return (0, missing);
+            var plan = BuildSharingPlan();
+            if (plan == null) return (0, missing);
+            int n = 0;
+            for (int t = 0; t < LANES; t++)
+            {
+                if (_kit.GetKind(t) != LaneSourceKind.Embedded) continue;
+                var h = _kit.LaneSha256(t);
+                if (h != null && _kit.LaneHasAudio(t) && !plan.StoresHere(h)) n++;
+            }
+            return (n, missing);
         }
 
         // Linked form: reload the lanes from the kit file. Per-lane velocity,

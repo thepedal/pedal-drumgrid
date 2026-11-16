@@ -25,6 +25,7 @@ namespace PedalDrumGrid
         TextBlock _kitLabel;
         TextBlock _linkStatus;
         CheckBox _linkBox;
+        CheckBox _ownCopyBox;
         readonly TextBox[] _laneName = new TextBox[PedalDrumGridMachine.LANES];
         readonly ComboBox[] _laneCombo = new ComboBox[PedalDrumGridMachine.LANES];
         readonly ComboBox[] _laneOutCombo = new ComboBox[PedalDrumGridMachine.LANES];
@@ -77,6 +78,23 @@ namespace PedalDrumGrid
             };
             row.Children.Add(_linkBox);
             root.Children.Add(row);
+
+            // v1.8.0: samples shared with other DrumGrids are saved once per song.
+            _ownCopyBox = new CheckBox
+            {
+                Content = "Store own copy of samples",
+                Margin = new Thickness(0, 0, 0, 6),
+                ToolTip = "Samples that several DrumGrids in the song use are saved only once, by one of them. " +
+                          "Tick this to make this DrumGrid always save all of its own samples, e.g. before " +
+                          "copying it to another song on its own or saving it as a template."
+            };
+            _ownCopyBox.Click += (_, __) =>
+            {
+                if (_machine == null) return;
+                _machine.StoreOwnCopy = _ownCopyBox.IsChecked == true;
+                RefreshKitLabel();
+            };
+            root.Children.Add(_ownCopyBox);
 
             _linkStatus = new TextBlock
             {
@@ -287,6 +305,14 @@ namespace PedalDrumGrid
             else
                 status = "Link is on but the lanes differ from " + System.IO.Path.GetFileName(path) +
                          " (or it can't be read), so the song stores the audio. Save Kit or Load Kit to link again.";
+            _ownCopyBox.IsChecked = _machine.StoreOwnCopy;
+            var (shared, missing) = _machine.SharingSummary();
+            if (shared > 0)
+                status += "  " + shared + (shared == 1 ? " lane is" : " lanes are") +
+                          " saved by another DrumGrid that uses the same sample.";
+            if (missing > 0)
+                status = "\u26A0 " + missing + (missing == 1 ? " lane is" : " lanes are") +
+                         " missing a shared sample: the DrumGrid that saved it is not in this song.  " + status;
             if (!string.IsNullOrEmpty(_machine.LinkWarning))
                 status = "\u26A0 " + _machine.LinkWarning + "  " + status;
             _linkStatus.Text = status;
