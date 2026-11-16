@@ -204,12 +204,14 @@ namespace PedalDrumGrid
                 ls.FilePath = path; ls.EmbeddedWav = wav;
                 ls.Snapshot = null;     // rebuild lazily
             }
+            _rev++;
         }
 
         public void AssignWavetableLane(int lane, int waveIndex)
         {
             if ((uint)lane >= _lanes.Length) return;
             var ls = _lanes[lane];
+            _rev++;                 // lane source changed: kit file may no longer match
             if (waveIndex <= 0) { ls.Kind = LaneSourceKind.None; ls.Name = null; ls.Snapshot = null; return; }
             ls.Kind = LaneSourceKind.Wavetable;
             ls.WaveIndex = waveIndex;
@@ -373,66 +375,173 @@ namespace PedalDrumGrid
         {
             try
             {
-                var doc = XDocument.Load(path);
-                var root = doc.Root;
-                if (root == null || root.Name != "PedalDrumGrid") return;
-                Name = (string)root.Attribute("name") ?? Path.GetFileNameWithoutExtension(path);
-                string baseDir = Path.GetDirectoryName(Path.GetFullPath(path));
-
-                foreach (var lane in _lanes)
-                {
-                    lane.Kind = LaneSourceKind.None; lane.Snapshot = null; lane.Name = null;
-                    lane.EmbeddedWav = null; lane.Velocity = 127; lane.Pitch = 0; lane.ChokeGroup = 0; lane.Out = 0;
-                }
-
-                foreach (var laneEl in root.Elements("Lane"))
-                {
-                    int idx = (int?)laneEl.Attribute("index") ?? -1;
-                    if (idx < 0 || idx >= _lanes.Length) continue;
-                    var ls = _lanes[idx];
-                    ls.Name = (string)laneEl.Attribute("name");
-
-                    var sample = laneEl.Element("Sample");
-                    if (sample != null)
-                    {
-                        string kind = (string)sample.Attribute("kind") ?? "file";
-                        ls.RootNote = (int?)sample.Attribute("rootNote") ?? 60;
-                        switch (kind)
-                        {
-                            case "embedded":
-                                ls.Kind = LaneSourceKind.Embedded;
-                                try { ls.EmbeddedWav = Convert.FromBase64String(sample.Value.Trim()); }
-                                catch { ls.Kind = LaneSourceKind.None; }
-                                break;
-                            case "wavetable":
-                                ls.Kind = LaneSourceKind.Wavetable;
-                                ls.WaveIndex = (int?)sample.Attribute("waveIndex") ?? 0;
-                                break;
-                            default: // "file"
-                                ls.Kind = LaneSourceKind.File;
-                                string rel = (string)sample.Attribute("path") ?? "";
-                                ls.FilePath = Path.IsPathRooted(rel) ? rel : Path.Combine(baseDir, rel);
-                                if (string.IsNullOrEmpty(ls.Name))
-                                    ls.Name = Path.GetFileNameWithoutExtension(ls.FilePath);
-                                break;
-                        }
-                    }
-
-                    var def = laneEl.Element("Defaults");
-                    if (def != null)
-                    {
-                        ls.Velocity   = (int?)def.Attribute("velocity") ?? 127;
-                        ls.Pitch      = (int?)def.Attribute("pitch") ?? 0;
-                        ls.ChokeGroup = (int?)def.Attribute("chokeGroup") ?? 0;
-                        ls.Out        = (int?)def.Attribute("out") ?? 0;   // 0 if pre-v1.5
-                    }
-
-                    ls.Snapshot = null;   // rebuild lazily
-                }
+                var parsed = ParseKitFile(path, out string kitName);
+                if (parsed == null) return;
+                Name = kitName;
+                for (int i = 0; i < _lanes.Length; i++) _lanes[i] = parsed[i];
                 ActiveKitPath = Path.GetFullPath(path);
+                _rev++;
                 PrebuildAll();            // decode embedded audio off the audio thread
             }
             catch { /* leave kit as-is on parse failure */ }
+        }
+
+        // Parse a .pdrumgrid.xml into a fresh lane array without touching the
+        // live kit. Shared by LoadFromFile and MatchesKitFile (v1.7.0).
+        // Returns null if the file isn't a DrumGrid kit.
+        LaneSource[] ParseKitFile(string path, out string kitName)
+        {
+            kitName = null;
+            var doc = XDocument.Load(path);
+            var root = doc.Root;
+            if (root == null || root.Name != "PedalDrumGrid") return null;
+            kitName = (string)root.Attribute("name") ?? Path.GetFileNameWithoutExtension(path);
+            string baseDir = Path.GetDirectoryName(Path.GetFullPath(path));
+
+            var lanes = new LaneSource[_lanes.Length];
+            for (int i = 0; i < lanes.Length; i++) lanes[i] = new LaneSource();
+
+            foreach (var laneEl in root.Elements("Lane"))
+            {
+                int idx = (int?)laneEl.Attribute("index") ?? -1;
+                if (idx < 0 || idx >= lanes.Length) continue;
+                var ls = lanes[idx];
+                ls.Name = (string)laneEl.Attribute("name");
+
+                var sample = laneEl.Element("Sample");
+                if (sample != null)
+                {
+                    string kind = (string)sample.Attribute("kind") ?? "file";
+                    ls.RootNote = (int?)sample.Attribute("rootNote") ?? 60;
+                    switch (kind)
+                    {
+                        case "embedded":
+                            ls.Kind = LaneSourceKind.Embedded;
+                            try { ls.EmbeddedWav = Convert.FromBase64String(sample.Value.Trim()); }
+                            catch { ls.Kind = LaneSourceKind.None; }
+                            break;
+                        case "wavetable":
+                            ls.Kind = LaneSourceKind.Wavetable;
+                            ls.WaveIndex = (int?)sample.Attribute("waveIndex") ?? 0;
+                            break;
+                        default: // "file"
+                            ls.Kind = LaneSourceKind.File;
+                            string rel = (string)sample.Attribute("path") ?? "";
+                            ls.FilePath = Path.IsPathRooted(rel) ? rel : Path.Combine(baseDir, rel);
+                            if (string.IsNullOrEmpty(ls.Name))
+                                ls.Name = Path.GetFileNameWithoutExtension(ls.FilePath);
+                            break;
+                    }
+                }
+
+                var def = laneEl.Element("Defaults");
+                if (def != null)
+                {
+                    ls.Velocity   = (int?)def.Attribute("velocity") ?? 127;
+                    ls.Pitch      = (int?)def.Attribute("pitch") ?? 0;
+                    ls.ChokeGroup = (int?)def.Attribute("chokeGroup") ?? 0;
+                    ls.Out        = (int?)def.Attribute("out") ?? 0;   // 0 if pre-v1.5
+                }
+            }
+            return lanes;
+        }
+
+        // ---- Kit-file link (v1.7.0) ---------------------------------------
+        // A linked song stores only the kit path, not the audio. That is safe
+        // only while the live lanes are exactly what the kit file holds, so the
+        // machine asks MatchesKitFile() before writing a linked state. The
+        // answer is cached on (path, file length, write time, lane revision):
+        // _rev bumps on every lane-source change, so a wave assigned after the
+        // kit was loaded makes the next save embed again.
+        int _rev;
+        public int Revision => _rev;
+        string _matchKey;
+        bool   _matchResult;
+        byte[] _matchHash;
+
+        public bool MatchesKitFile() => MatchesKitFile(out _);
+
+        public bool MatchesKitFile(out byte[] sha256)
+        {
+            sha256 = null;
+            string path = ActiveKitPath;
+            try
+            {
+                if (string.IsNullOrEmpty(path) || !File.Exists(path)) return false;
+                var fi = new FileInfo(path);
+                string key = path + "|" + fi.Length + "|" + fi.LastWriteTimeUtc.Ticks + "|" + _rev;
+                if (key == _matchKey) { sha256 = _matchHash; return _matchResult; }
+
+                bool ok = false;
+                var parsed = ParseKitFile(path, out _);
+                if (parsed != null)
+                {
+                    ok = true;
+                    for (int i = 0; i < _lanes.Length && ok; i++)
+                        ok = SameSource(_lanes[i], parsed[i]);
+                }
+                _matchHash = ok ? HashFile(path) : null;
+                _matchResult = ok;
+                _matchKey = key;
+                sha256 = _matchHash;
+                return ok;
+            }
+            catch { return false; }
+        }
+
+        static bool SameSource(LaneSource a, LaneSource b)
+        {
+            if (a.Kind != b.Kind) return false;
+            if (a.ChokeGroup != b.ChokeGroup) return false;
+            switch (a.Kind)
+            {
+                case LaneSourceKind.None:      return true;
+                case LaneSourceKind.Wavetable: return a.WaveIndex == b.WaveIndex;
+                case LaneSourceKind.File:
+                    return a.RootNote == b.RootNote &&
+                           string.Equals(a.FilePath, b.FilePath, StringComparison.OrdinalIgnoreCase);
+                case LaneSourceKind.Embedded:
+                    return a.RootNote == b.RootNote &&
+                           (a.EmbeddedWav ?? Array.Empty<byte>()).AsSpan()
+                               .SequenceEqual((b.EmbeddedWav ?? Array.Empty<byte>()).AsSpan());
+            }
+            return false;
+        }
+
+        public static byte[] HashFile(string path)
+        {
+            using var fs = File.OpenRead(path);
+            return System.Security.Cryptography.SHA256.HashData(fs);
+        }
+
+        // Linked-state helpers: names ride in the song so a lane rename after
+        // loading the kit doesn't force the audio back into the song.
+        public void WriteLaneNames(BinaryWriter bw)
+        {
+            bw.Write((byte)_lanes.Length);
+            foreach (var ls in _lanes) WriteStr(bw, ls.Name);
+        }
+
+        public static string[] ReadLaneNames(BinaryReader br)
+        {
+            int n = br.ReadByte();
+            var names = new string[n];
+            for (int i = 0; i < n; i++) names[i] = ReadStr(br);
+            return names;
+        }
+
+        public void ApplyLaneNames(string[] names)
+        {
+            if (names == null) return;
+            for (int i = 0; i < names.Length && i < _lanes.Length; i++)
+                _lanes[i].Name = string.IsNullOrEmpty(names[i]) ? null : names[i];
+        }
+
+        // Empty every lane (linked kit file missing at load).
+        public void ClearLanes()
+        {
+            for (int i = 0; i < _lanes.Length; i++) _lanes[i] = new LaneSource();
+            _rev++;
         }
 
         public void SaveToFile(string path)

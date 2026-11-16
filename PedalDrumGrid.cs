@@ -25,7 +25,7 @@ namespace PedalDrumGrid
     public class PedalDrumGridMachine : IBuzzMachine
     {
         // Single source of truth for the version (AboutWindow §1.3). Bump here.
-        internal const string Version = "1.6.1";
+        internal const string Version = "1.7.0";
 
         public const int LANES        = 16;
         public const int MUTE_OUTS    = 8;               // Mute Out 1..8 (outs 1..8 only)
@@ -832,12 +832,40 @@ namespace PedalDrumGrid
         // =================================================================
         //  STATE PERSISTENCE (Core §39 framing)
         // =================================================================
-        // v6: MachineState is kit + per-lane output routing. (The short-lived v5
-        // master velocity-humanize byte is gone — Humanize Vel is now a per-track
-        // pattern parameter, not machine state.) Reader accepts v1..v6; a v5 state
-        // simply has a trailing humanize byte that we leave unread.
+        // v7 (1.7.0): adds a flags byte and an optional LINKED form.
+        //   MAGIC, VERSION, kitPath (u16 len + UTF-8), flags (bit0 = Link Kit File),
+        //   form (0 = full lanes, 1 = linked), then
+        //     full:   WriteLanes (sources incl. embedded audio, names)
+        //     linked: int64 kit file length, 32-byte SHA-256, lane names
+        //   then 16 bytes of per-lane output routing.
+        // Linked is written only when Link Kit File is on AND the live lanes are
+        // exactly what the kit file holds (DrumKit.MatchesKitFile); otherwise the
+        // full form is written, so a linked song never silently loses an edit.
+        // v6 and earlier: MAGIC, VERSION, kitPath, lanes, routing (v4+), and v5's
+        // trailing humanize byte, which is ignored. Reader accepts v1..v7.
         const uint MAGIC = 0x44475250u;   // "PRGD"
-        const byte VERSION = 6;
+        const byte VERSION = 7;
+        const byte FLAG_LINK = 1;
+        const byte FORM_FULL = 0, FORM_LINKED = 1;
+
+        // Store the kit file's path in the song instead of the audio (GUI checkbox).
+        public bool LinkKitFile { get; set; }
+
+        // Set at load when a linked kit file is missing or has changed since the
+        // song was saved; shown by the GUI. Cleared by a successful Load Kit.
+        public string LinkWarning { get; private set; }
+
+        // A link read from the song whose kit file was missing at load. Written
+        // back unchanged on save as long as the lanes haven't been touched, so
+        // opening a song while the kit folder is unavailable and saving it does
+        // not drop the link. Cleared by Load Kit.
+        sealed class UnresolvedLink { public long Length; public byte[] Hash; public string[] Names; public int Rev; }
+        UnresolvedLink _unresolved;
+
+        bool KeepUnresolvedLink => LinkKitFile && _unresolved != null && _unresolved.Rev == _kit.Revision;
+
+        // True if the next song save will store only the kit path.
+        public bool WillSaveLinked => KeepUnresolvedLink || (LinkKitFile && _kit.MatchesKitFile());
 
         public byte[] MachineState
         {
@@ -853,7 +881,35 @@ namespace PedalDrumGrid
                     var pb = System.Text.Encoding.UTF8.GetBytes(kitPath);
                     bw.Write((ushort)pb.Length);
                     bw.Write(pb);
-                    _kit.WriteLanes(bw);          // full per-lane source state
+                    bw.Write(LinkKitFile ? FLAG_LINK : (byte)0);
+
+                    byte[] hash = null;
+                    bool linked = LinkKitFile && _kit.MatchesKitFile(out hash) && hash != null;
+                    if (!linked && KeepUnresolvedLink)
+                    {
+                        bw.Write(FORM_LINKED);
+                        bw.Write(_unresolved.Length);
+                        bw.Write(_unresolved.Hash);
+                        bw.Write((byte)_unresolved.Names.Length);
+                        foreach (var n in _unresolved.Names)
+                        {
+                            var nb = System.Text.Encoding.UTF8.GetBytes(n ?? "");
+                            bw.Write((ushort)nb.Length);
+                            bw.Write(nb);
+                        }
+                    }
+                    else if (linked)
+                    {
+                        bw.Write(FORM_LINKED);
+                        bw.Write(new System.IO.FileInfo(kitPath).Length);
+                        bw.Write(hash);                 // 32 bytes
+                        _kit.WriteLaneNames(bw);
+                    }
+                    else
+                    {
+                        bw.Write(FORM_FULL);
+                        _kit.WriteLanes(bw);            // full per-lane source state
+                    }
                     for (int t = 0; t < LANES; t++) bw.Write((byte)_laneOut[t]);   // v4+ routing
                     return ms.ToArray();
                 }
@@ -868,14 +924,31 @@ namespace PedalDrumGrid
                     using var br = new System.IO.BinaryReader(ms);
                     if (br.ReadUInt32() != MAGIC) return;
                     byte v = br.ReadByte();
-                    if (v < 1 || v > 6) return;            // unknown future version
+                    if (v < 1 || v > VERSION) return;      // unknown future version
                     int len = br.ReadUInt16();
                     string kitPath = System.Text.Encoding.UTF8.GetString(br.ReadBytes(len));
                     _kit.SetActiveKitPath(string.IsNullOrEmpty(kitPath) ? null : kitPath);
-                    if (v >= 2)
-                        _kit.ReadLanes(br, withNames: v >= 3);   // self-contained lane state
-                    else if (!string.IsNullOrEmpty(kitPath))
-                        _kit.LoadFromFile(kitPath);        // v1: reload from file
+                    LinkWarning = null;
+                    _unresolved = null;
+
+                    if (v >= 7)
+                    {
+                        byte flags = br.ReadByte();
+                        LinkKitFile = (flags & FLAG_LINK) != 0;
+                        byte form = br.ReadByte();
+                        if (form == FORM_LINKED)
+                            ReadLinked(br, kitPath);
+                        else
+                            _kit.ReadLanes(br, withNames: true);
+                    }
+                    else
+                    {
+                        LinkKitFile = false;
+                        if (v >= 2)
+                            _kit.ReadLanes(br, withNames: v >= 3);   // self-contained lane state
+                        else if (!string.IsNullOrEmpty(kitPath))
+                            _kit.LoadFromFile(kitPath);        // v1: reload from file
+                    }
                     if (v >= 4)
                         for (int t = 0; t < LANES; t++)
                             _laneOut[t] = Math.Min(LANES, Math.Max(1, (int)br.ReadByte()));
@@ -884,6 +957,36 @@ namespace PedalDrumGrid
                 }
                 catch { /* corrupt — start fresh */ }
             }
+        }
+
+        // Linked form: reload the lanes from the kit file. Per-lane velocity,
+        // pitch and routing are not taken from the file (velocity/pitch ride the
+        // track parameters, routing follows in the state), only the sources and
+        // choke groups, which are what the hash covered when the song was saved.
+        void ReadLinked(System.IO.BinaryReader br, string kitPath)
+        {
+            long savedLen = br.ReadInt64();
+            byte[] savedHash = br.ReadBytes(32);
+            string[] names = DrumKit.ReadLaneNames(br);
+
+            if (string.IsNullOrEmpty(kitPath) || !System.IO.File.Exists(kitPath))
+            {
+                _kit.ClearLanes();
+                _kit.SetActiveKitPath(string.IsNullOrEmpty(kitPath) ? null : kitPath);
+                _unresolved = new UnresolvedLink { Length = savedLen, Hash = savedHash, Names = names, Rev = _kit.Revision };
+                LinkWarning = "Kit file not found: " + kitPath + ". Use Load Kit to relink it.";
+                return;
+            }
+            _kit.LoadFromFile(kitPath);
+            _kit.ApplyLaneNames(names);
+            try
+            {
+                var fi = new System.IO.FileInfo(kitPath);
+                if (fi.Length != savedLen ||
+                    !DrumKit.HashFile(kitPath).AsSpan().SequenceEqual(savedHash.AsSpan()))
+                    LinkWarning = "Kit file has changed since this song was saved.";
+            }
+            catch { }
         }
 
         // Expose to the GUI.
@@ -906,6 +1009,8 @@ namespace PedalDrumGrid
         public void LoadKit(string path)
         {
             _kit.LoadFromFile(path);
+            LinkWarning = null;
+            _unresolved = null;
             for (int t = 0; t < LANES; t++)
             {
                 _pendVel[t]   = _kit.GetLaneVelocity(t);
@@ -923,6 +1028,11 @@ namespace PedalDrumGrid
                 _kit.SetLaneOut(t, _laneOut[t]);
             }
             _kit.SaveToFile(path);
+            _unresolved = null;
+            // With Link Kit File on, take the lanes back from the file just written
+            // so they match it exactly (wavetable lanes become the embedded copies
+            // the file holds) and the song can store the link. Same audio.
+            if (LinkKitFile) LoadKit(path);
         }
     }
 

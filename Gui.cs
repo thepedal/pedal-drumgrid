@@ -23,6 +23,8 @@ namespace PedalDrumGrid
         PedalDrumGridMachine _machine;
 
         TextBlock _kitLabel;
+        TextBlock _linkStatus;
+        CheckBox _linkBox;
         readonly TextBox[] _laneName = new TextBox[PedalDrumGridMachine.LANES];
         readonly ComboBox[] _laneCombo = new ComboBox[PedalDrumGridMachine.LANES];
         readonly ComboBox[] _laneOutCombo = new ComboBox[PedalDrumGridMachine.LANES];
@@ -56,7 +58,35 @@ namespace PedalDrumGrid
             row.Children.Add(loadBtn);
             row.Children.Add(saveBtn);
             row.Children.Add(refreshBtn);
+
+            // v1.7.0: store the kit file path in the song instead of its audio.
+            _linkBox = new CheckBox
+            {
+                Content = "Link kit file (don't store audio in song)",
+                Margin = new Thickness(8, 0, 0, 0),
+                VerticalAlignment = VerticalAlignment.Center,
+                ToolTip = "When on, and the lanes still match the loaded kit file, the song stores only the " +
+                          "kit file's path. Much smaller songs, but the song needs that file to be present. " +
+                          "If you change a lane after loading the kit, the audio is stored again."
+            };
+            _linkBox.Click += (_, __) =>
+            {
+                if (_machine == null) return;
+                _machine.LinkKitFile = _linkBox.IsChecked == true;
+                RefreshKitLabel();
+            };
+            row.Children.Add(_linkBox);
             root.Children.Add(row);
+
+            _linkStatus = new TextBlock
+            {
+                Margin = new Thickness(0, 0, 0, 8),
+                Opacity = 0.8,
+                Width = 560,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                TextWrapping = TextWrapping.Wrap
+            };
+            root.Children.Add(_linkStatus);
 
             // Per-lane wave assignment grid (scrollable: 16 rows).
             var lanesPanel = new StackPanel { Orientation = Orientation.Vertical };
@@ -88,6 +118,7 @@ namespace PedalDrumGrid
                     if (combo.SelectedItem is WaveEntry we)
                     {
                         _machine.AssignLaneWave(captured, we.Index);
+                        RefreshKitLabel();
                         // AssignLaneWave captured the wave's name — reflect it.
                         _populating = true;
                         _laneName[captured].Text = _machine.Kit.GetLaneName(captured);
@@ -196,7 +227,7 @@ namespace PedalDrumGrid
             if (dlg.ShowDialog() == true)
             {
                 _machine.SaveKit(dlg.FileName);   // embeds audio + per-lane vel/pitch
-                RefreshKitLabel();
+                RefreshAll();                     // lanes may have been relinked to the file
             }
         }
 
@@ -243,6 +274,22 @@ namespace PedalDrumGrid
         {
             if (_machine == null) return;
             _kitLabel.Text = "Kit: " + (_machine.Kit.Name ?? "(none)");
+
+            _linkBox.IsChecked = _machine.LinkKitFile;
+            string status;
+            string path = _machine.Kit.ActiveKitPath;
+            if (!_machine.LinkKitFile)
+                status = "Song stores the kit audio.";
+            else if (_machine.WillSaveLinked)
+                status = "Song stores only the link: " + path;
+            else if (string.IsNullOrEmpty(path))
+                status = "Link is on but no kit file is loaded, so the song stores the audio. Load or save a kit to link it.";
+            else
+                status = "Link is on but the lanes differ from " + System.IO.Path.GetFileName(path) +
+                         " (or it can't be read), so the song stores the audio. Save Kit or Load Kit to link again.";
+            if (!string.IsNullOrEmpty(_machine.LinkWarning))
+                status = "\u26A0 " + _machine.LinkWarning + "  " + status;
+            _linkStatus.Text = status;
         }
 
         void RefreshAll()

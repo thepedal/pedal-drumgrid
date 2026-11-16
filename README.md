@@ -7,7 +7,7 @@ per-lane Velocity, per-lane Humanize Vel, and two tracker-style **Command/Argume
 effect columns (v1.1). Samples come from the ReBuzz wavetable (assigned per lane in the
 GUI) or from a self-contained `.pdrumgrid.xml` kit with embedded audio.
 
-Status: **v1.6.1** (a muted out is now also silent in the out 0 mix) — **v1.6.0** (per-output mutes for outs 1..8; **parameter layout change**, see below) — **v1.5.4** (Master Gain range raised to 254, About command, see below) — **v1.5.3** (Master Gain now also scales the group buses, see below) — **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
+Status: **v1.7.0** (optional kit-file link: the song stores the kit path instead of the audio, see below) — **v1.6.1** (a muted out is now also silent in the out 0 mix) — **v1.6.0** (per-output mutes for outs 1..8; **parameter layout change**, see below) — **v1.5.4** (Master Gain range raised to 254, About command, see below) — **v1.5.3** (Master Gain now also scales the group buses, see below) — **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
 several lanes onto one bus), grid-aware swing (`Swing Unit` 1/8 or 1/16),
 master `Humanize` (late-only timing on every hit) and **per-track `Humanize Vel`**
 (quieter-only velocity scatter on chosen lanes), kit load/save with embedded
@@ -32,7 +32,7 @@ deferred-trigger fade-cross (Tracker §4.2, §10).
 | **Velocity + Commands read from the firing lane's pvalue at trigger time** | The trigger is a global param consumed in `Work`; the track setters can land too late to affect the same-row hit (pattern cells looked like they did nothing). Fix: in `SetTrig`, read the firing lane's **own** Velocity and Command/Argument pvalues (Tracker §16.3) — the sequencer fills all row pvalues before any setter runs. Velocity is **held** (kept on `NoValue`); commands are **momentary** (None when `NoValue`). `Humanize Vel` is a second **held** track param read the same way, so velocity scatter can be set on individual lanes (just a snare, one hat) rather than globally. Guards: only while `Buzz.Playing`, and only for `lane < TrackCount` (beyond the real track count the `int[256]` slot is still `0`, not `NoValue`, and would clobber the held velocity to 0 → silent lane). Same-row multi-lane hits each read their own pvalue, so Core §14 collisions don't matter. |
 | Per-lane **wave assignment is GUI-only**, persisted in `MachineState` | Kept off the pattern grid so the trigger block butts against the per-track section. The GUI's 16 per-lane pickers point each lane at a wavetable slot; the kit is the single source of truth and its full per-lane state (wavetable slot or file path) is serialised in `MachineState` (Core §39), since non-parameter state isn't auto-persisted. |
 | **Swing** = per-step trigger *delay*, not a step clock | DrumGrid doesn't own a step clock — triggers arrive from pattern rows. So swing delays off-beat steps using sub-tick scheduling (Tracker §7.7 note-delay machinery), reusing Chord's ratio math (Chord §3, §11) recast as a delay. See "Swing" below. |
-| Non-parameter state framed in `byte[]` `MachineState` (v6) | Magic+version+length-prefixed framing (Core §39.1). Holds the kit reference, full per-lane source state (embedded audio + names) and per-lane **output routing**. Swing / Humanize / Master Gain are ordinary ReBuzz-persisted *parameters* (not in `MachineState`); wave assignment and routing aren't parameters, so they live here. The reader version-tolerates v1..v6 (missing fields default). |
+| Non-parameter state framed in `byte[]` `MachineState` (v7) | Magic+version+length-prefixed framing (Core §39.1). Holds the kit reference, full per-lane source state (embedded audio + names) and per-lane **output routing**. Swing / Humanize / Master Gain are ordinary ReBuzz-persisted *parameters* (not in `MachineState`); wave assignment and routing aren't parameters, so they live here. v7 (1.7.0) adds a flags byte and an optional *linked* form that stores the kit path, file length and SHA-256 instead of the lane audio (see *Kit-file link*). The reader version-tolerates v1..v7 (missing fields default). |
 | GUI base class = `FrameworkElement` (if custom-painted) | `UserControl`'s template silently overpaints `OnRender` (Core §26.7). The kit/swing panel is control-composed, so it can stay `UserControl`; the optional lane meters/grid preview must be `FrameworkElement`. |
 
 ### Open choices you may want to change
@@ -244,6 +244,41 @@ permanent. No `MachineState` or kit-format change. Songs saved with 1.6.0 do not
 load in 1.5.x.
 
 ---
+
+## Kit-file link (v1.7.0)
+
+By default a DrumGrid stores every lane's audio in the song, so the song is
+self-contained. That audio is large: a 16-lane kit of 48 kHz stereo one-shots is
+several MB, it is base64-encoded twice on the way into a `.bmxml` (machine state
+inside the host's `<Data>`), and a pair of DrumGrids sharing a kit stores it twice.
+
+**Link kit file (don't store audio in song)**, a checkbox next to the kit buttons,
+makes the song store only the kit file's path, its length and a SHA-256 of it,
+plus the lane names and output routing (a few hundred bytes). On load the lanes
+are read back from that file.
+
+- **Only when nothing would be lost.** The linked form is written only if the
+  live lanes are exactly what the kit file holds (same kind, choke group, root
+  note and audio bytes per lane). Assign a wavetable wave to a lane after loading
+  the kit and the next save stores the audio again; the status line under the
+  buttons says which the next save will do. Renaming a lane does not break the
+  link (names are stored in the song).
+- **Save Kit with the link on** reloads the lanes from the file just written, so
+  wavetable lanes become the file's embedded copies (same audio) and the song can
+  link to it.
+- **Missing file.** The lanes load empty and the GUI shows a warning; Load Kit
+  relinks. Saving the song in that state keeps the original link (as long as no
+  lane was changed), so opening a song while the kit folder is unavailable does
+  not drop it.
+- **Changed file.** The song plays what the file holds now and the GUI warns that
+  the file changed since the song was saved.
+- **Trade-off.** A linked song depends on the kit file. Keep kit files with the
+  project, and turn the link off before sending a song to someone else.
+
+**Compatibility.** Songs saved with 1.6.x and earlier load unchanged (the link is
+off). A song saved with 1.7.0 does not load its kit in older versions (they
+reject state version 7 and start with an empty kit). No parameter or kit-format
+change.
 
 ## Humanize (timing + velocity)
 
