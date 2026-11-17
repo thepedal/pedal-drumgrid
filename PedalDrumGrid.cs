@@ -25,7 +25,7 @@ namespace PedalDrumGrid
     public class PedalDrumGridMachine : IBuzzMachine
     {
         // Single source of truth for the version (AboutWindow §1.3). Bump here.
-        internal const string Version = "1.8.0";
+        internal const string Version = "1.8.1";
 
         public const int LANES        = 16;
         public const int MUTE_OUTS    = 8;               // Mute Out 1..8 (outs 1..8 only)
@@ -181,6 +181,7 @@ namespace PedalDrumGrid
             if (_tracksInit) return;
             var m = host?.Machine;
             if (m == null) return;            // not ready yet — a later Work reschedules
+            _kit.EnsureWavetableHook();       // v1.8.1: host ready now; hook if the load path couldn't
             try
             {
                 if (m.TrackCount < LANES) m.TrackCount = LANES;

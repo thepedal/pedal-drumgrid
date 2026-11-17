@@ -52,9 +52,11 @@ namespace PedalDrumGrid
     }
 
     // Owns the per-lane sources, the .pdrumgrid.xml load/save, and the bridge
-    // to the ReBuzz wavetable. Snapshots are cached for the lifetime of the kit
-    // and NOT invalidated on IWave.PropertyChanged (M1 §2 — that path nukes the
-    // cache and clicks; reload the machine to refresh a replaced wave).
+    // to the ReBuzz wavetable. Snapshots are cached. Wavetable lanes are rebuilt
+    // when IWavetable.WaveChanged fires for their slot (v1.8.1): the new snapshot
+    // is built on the notifying thread and swapped in, never nulled, so the
+    // audio thread neither rebuilds nor clicks (M1 §2). Playing voices keep the
+    // snapshot they started with.
     public sealed class DrumKit
     {
         readonly Func<IBuzz> _getBuzz;
@@ -75,6 +77,63 @@ namespace PedalDrumGrid
         public int LaneCount => _lanes.Length;
 
         public void SetActiveKitPath(string path) => ActiveKitPath = path;
+
+        // ---- Wavetable change hook (v1.8.1) --------------------------------
+        // Why: when a .bmxml song loads, ReBuzz creates the wavetable slots and
+        // their layers (with SampleCount set) BEFORE it initialises machines, but
+        // allocates and fills the sample data AFTER (BMXMLFile.LoadSongData:
+        // Load Wavetable, then Load Machines / InitMachines, then Load Waves).
+        // A wavetable lane built from MachineState at init therefore read a
+        // full-length buffer of silence (GetDataAsFloat returns early while the
+        // layer has no data) and cached it, so the lane never sounded until it was
+        // reassigned. Load Waves calls wave.Invalidate() per layer, which raises
+        // IWavetable.WaveChanged(index); rebuilding the lane there fixes the load
+        // and also picks up a wave replaced or edited later.
+        // The handler holds the kit weakly and unsubscribes itself once the kit
+        // is gone (machines have no teardown hook).
+        sealed class WaveHook
+        {
+            readonly WeakReference<DrumKit> _kit;
+            readonly IWavetable _wt;
+            public WaveHook(DrumKit kit, IWavetable wt) { _kit = new WeakReference<DrumKit>(kit); _wt = wt; }
+            public void OnWaveChanged(int index)
+            {
+                if (_kit.TryGetTarget(out var kit)) kit.OnWavetableWaveChanged(index);
+                else try { _wt.WaveChanged -= OnWaveChanged; } catch { }
+            }
+        }
+        IWavetable _hookedWt;
+        WaveHook _hook;
+
+        // Idempotent; call from load/UI paths (never Work). Re-hooks if the song's
+        // wavetable object has changed.
+        public void EnsureWavetableHook()
+        {
+            try
+            {
+                var wt = _getBuzz?.Invoke()?.Song?.Wavetable;
+                if (wt == null || ReferenceEquals(wt, _hookedWt)) return;
+                if (_hookedWt != null && _hook != null)
+                    try { _hookedWt.WaveChanged -= _hook.OnWaveChanged; } catch { }
+                _hook = new WaveHook(this, wt);
+                wt.WaveChanged += _hook.OnWaveChanged;
+                _hookedWt = wt;
+            }
+            catch { }
+        }
+
+        // index = 0-based wavetable slot (lanes store it 1-based).
+        void OnWavetableWaveChanged(int index)
+        {
+            for (int i = 0; i < _lanes.Length; i++)
+            {
+                var ls = _lanes[i];
+                if (ls.Kind != LaneSourceKind.Wavetable || ls.WaveIndex - 1 != index) continue;
+                WaveSnapshot snap = null;
+                try { snap = BuildFromWavetable(ls.WaveIndex); } catch { }
+                ls.Snapshot = snap;   // null (wave removed) falls back to the lazy build
+            }
+        }
 
         // ---- GUI accessors -------------------------------------------------
         public LaneSourceKind GetKind(int lane) =>
@@ -257,6 +316,7 @@ namespace PedalDrumGrid
             if ((uint)lane >= _lanes.Length) return;
             var ls = _lanes[lane];
             _rev++;                 // lane source changed: kit file may no longer match
+            EnsureWavetableHook();
             if (waveIndex <= 0) { ls.Kind = LaneSourceKind.None; ls.Name = null; ls.Snapshot = null; return; }
             ls.Kind = LaneSourceKind.Wavetable;
             ls.WaveIndex = waveIndex;
@@ -308,6 +368,7 @@ namespace PedalDrumGrid
         // any shared samples its lanes are waiting for (v1.8.0).
         public void PrebuildAll()
         {
+            EnsureWavetableHook();
             ResolvePending();
             for (int i = 0; i < _lanes.Length; i++)
             {

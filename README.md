@@ -7,7 +7,7 @@ per-lane Velocity, per-lane Humanize Vel, and two tracker-style **Command/Argume
 effect columns (v1.1). Samples come from the ReBuzz wavetable (assigned per lane in the
 GUI) or from a self-contained `.pdrumgrid.xml` kit with embedded audio.
 
-Status: **v1.8.0** (samples shared by several DrumGrids are saved once per song, see below) — **v1.7.0** (optional kit-file link: the song stores the kit path instead of the audio, see below) — **v1.6.1** (a muted out is now also silent in the out 0 mix) — **v1.6.0** (per-output mutes for outs 1..8; **parameter layout change**, see below) — **v1.5.4** (Master Gain range raised to 254, About command, see below) — **v1.5.3** (Master Gain now also scales the group buses, see below) — **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
+Status: **v1.8.1** (wavetable lanes now sound after a song loads, see below) — **v1.8.0** (samples shared by several DrumGrids are saved once per song, see below) — **v1.7.0** (optional kit-file link: the song stores the kit path instead of the audio, see below) — **v1.6.1** (a muted out is now also silent in the out 0 mix) — **v1.6.0** (per-output mutes for outs 1..8; **parameter layout change**, see below) — **v1.5.4** (Master Gain range raised to 254, About command, see below) — **v1.5.3** (Master Gain now also scales the group buses, see below) — **v1.5.2** (trigger timing fix, see below; no parameter or state changes) — **v1.5**: multi-out triggering with **per-lane output routing** (group
 several lanes onto one bus), grid-aware swing (`Swing Unit` 1/8 or 1/16),
 master `Humanize` (late-only timing on every hit) and **per-track `Humanize Vel`**
 (quieter-only velocity scatter on chosen lanes), kit load/save with embedded
@@ -279,6 +279,26 @@ are read back from that file.
 off). A song saved with 1.7.0 does not load its kit in older versions (they
 reject state version 7 and start with an empty kit). No parameter or kit-format
 change.
+
+## Wavetable lanes after loading a song (v1.8.1)
+
+Up to 1.8.0, lanes assigned to wavetable waves were silent after opening a
+`.bmxml` song until each lane was reassigned. ReBuzz's loader
+(`BMXMLFile.LoadSongData`) creates the wavetable slots and their layers, with
+their lengths, before it initialises machines, but allocates and fills the sample
+data afterwards. DrumGrid built its wavetable lanes from `MachineState` during
+machine init, read a full-length buffer of silence, and cached it.
+
+1.8.1 subscribes to `IWavetable.WaveChanged`, which the loader raises as each wave
+finishes loading, and rebuilds the lanes that use that slot. The new sample is
+built on the notifying thread and swapped in, so the audio thread never rebuilds
+and playing hits are not cut. The same hook means replacing or editing a wave in
+the wavetable now updates its lanes straight away (previously the machine had to
+be reloaded). The subscription holds the machine weakly and removes itself once
+the machine is gone.
+
+Embedded and file lanes were never affected. No parameter, `MachineState` or
+kit-format change.
 
 ## Shared samples (v1.8.0)
 
